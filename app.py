@@ -1,257 +1,319 @@
 import streamlit as st
-import pandas as pd
 import folium
 from streamlit_folium import st_folium
+from folium.plugins import MeasureControl
 from geopy.geocoders import ArcGIS
-from shapely.geometry import Point, shape, Polygon, box
-from shapely.ops import nearest_points
+from shapely.geometry import shape, Point, box, mapping
+import pandas as pd
 import json
-from directaccess import DirectAccessV2
 
-# -------------------------------------------------------------------------
-# 1. UI Configuration & CSS Injection
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 1. DEPENDENCY CHECK
+# -----------------------------------------------------------------------------
+try:
+    from enverus_developer_api import DirectAccess
+except ImportError:
+    st.set_page_config(page_title="Setup Error", page_icon="⚠️")
+    st.error("⚠️ **Missing Library: `enverus-developer-api`**")
+    st.markdown("""
+        **How to fix this:**
+        1. **Streamlit Cloud:** Add `enverus-developer-api` to your `requirements.txt` file.
+        2. **Local Computer:** Run `pip install enverus-developer-api` in your terminal.
+    """)
+    st.stop()
+
+# -----------------------------------------------------------------------------
+# 2. CONFIGURATION & THEME
+# -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="OKC Well Discovery Portal",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_icon="🛢️",
+    layout="wide"
 )
 
-# Custom CSS for Navy Blue headers and high contrast
-custom_css = """
-<style>
-    h1, h2, h3, h4, .stMetricLabel {
-        color: #000080 !important; /* Navy Blue */
+st.markdown("""
+    <style>
+    /* Global Background */
+    .stApp { background-color: #f4f6f9; }
+    
+    /* Headers - Force Navy Blue */
+    h1, h2, h3, h4, h5 {
+        color: #000080 !important;
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        font-weight: 800 !important;
     }
-    .stHeader {
-        color: #1E90FF !important; /* Light Blue accent fallback */
+    
+    /* Metrics - The Label */
+    div[data-testid="stMetricLabel"] {
+        color: #000080 !important; 
+        font-size: 16px !important;
+        font-weight: 700 !important;
     }
-    /* Enhance table header visibility */
-    th {
-        background-color: #000080 !important;
-        color: white !important;
+    
+    /* Metrics - The Value */
+    div[data-testid="stMetricValue"] {
+        color: #1E90FF !important;
+        font-size: 32px !important;
+        font-weight: 700 !important;
     }
-</style>
-"""
-st.markdown(custom_css, unsafe_allow_html=True)
+    
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #e6eaee;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
-# -------------------------------------------------------------------------
-# 2. Helper Functions: Data & Geocoding
-# -------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 3. GEOSPATIAL UTILITIES
+# -----------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600)
-def fetch_enverus_data():
-    """
-    Connects to Enverus DirectAccessV2 and fetches Oklahoma County wells.
-    Uses st.secrets for credentials.
-    """
+@st.cache_data(show_spinner=False)
+def get_lat_long_arcgis(address_str):
+    """Geocodes using Esri ArcGIS. Includes error handling."""
     try:
-        # Credential Retrieval
-        creds = st.secrets["enverus"]
-        
-        d2 = DirectAccessV2(
-            client_id=creds["client_id"],
-            client_secret=creds["client_secret"],
-            api_key=creds["api_key"]
-        )
-
-        # Dataset: well-origins (or 'wells' depending on subscription)
-        # Filter: Oklahoma County, OK to optimize performance
-        # Fields: Limit fields to reduce payload size
-        query_params = {
-            'dataset': 'well-origins',
-            'query': "County = 'OKLAHOMA' AND State = 'OK'",
-            'fields': 'API,WellName,OperatorName,Latitude,Longitude,TotalDepth',
-            'pagesize': 10000  # Adjust based on needs
-        }
-
-        # Fetch data (returns a generator, convert to list of dicts)
-        records = []
-        for row in d2.query(**query_params):
-            records.append(row)
-            # Safety break for demo if dataset is massive
-            if len(records) >= 5000: 
-                break
-        
-        if not records:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(records)
-        
-        # Ensure numeric types
-        df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
-        df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
-        df['TotalDepth'] = pd.to_numeric(df['TotalDepth'], errors='coerce')
-        
-        # Drop rows without valid coordinates
-        df = df.dropna(subset=['Latitude', 'Longitude'])
-        
-        return df
-
-    except Exception as e:
-        st.error(f"Enverus Connection Error: {str(e)}")
-        return pd.DataFrame()
-
-def get_location_coordinates(address):
-    """
-    Geocodes address using ArcGIS (Free, No API Key).
-    """
-    geolocator = ArcGIS()
-    try:
-        location = geolocator.geocode(address)
+        geolocator = ArcGIS(user_agent="okc_discovery_portal_prod", timeout=5)
+        location = geolocator.geocode(address_str)
         if location:
             return location.latitude, location.longitude
         return None, None
     except Exception:
         return None, None
 
-def calculate_distance_feet(row, target_geom):
+def create_fallback_boundary(lat, lon):
+    """Creates a ~10 acre box (approx 200m x 200m) around the point."""
+    delta = 0.002
+    minx, miny = lon - delta, lat - delta
+    maxx, maxy = lon + delta, lat + delta
+    return box(minx, miny, maxx, maxy)
+
+def calculate_distance_feet(point_geom, poly_geom):
+    """Calculates distance in feet (0 if inside)."""
+    if poly_geom.contains(point_geom):
+        return 0.0
+    # Approx conversion at OK latitudes (35N): 1 deg lat ~= 364,000 ft
+    return poly_geom.distance(point_geom) * 364000 
+
+# -----------------------------------------------------------------------------
+# 4. ENVERUS DATA INTEGRATION (REAL SDK)
+# -----------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600)
+def fetch_wells_enverus(center_lat, center_lon, radius_miles=2):
     """
-    Calculates approx distance in feet from a Well Point to a Target Geometry 
-    (Point or Polygon).
+    Queries Enverus DirectAccess (well-origins) using the official SDK.
+    Filters: State=OK, County=OKLAHOMA.
     """
-    well_point = Point(row['Longitude'], row['Latitude'])
-    
-    # Shapely distance returns degrees in WGS84
-    # We find the nearest point on the target geometry to the well
-    p1, p2 = nearest_points(well_point, target_geom)
-    
-    # Calculate simple Euclidean distance in degrees
-    degree_dist = p1.distance(p2)
-    
-    # Approx conversion: 1 degree lat ~= 364,000 feet
-    # This is an approximation suitable for local county scale
-    feet_dist = degree_dist * 364000
-    
-    return int(feet_dist)
+    # 1. Check Credentials
+    if "enverus" not in st.secrets:
+        st.error("❌ Enverus credentials missing in `.streamlit/secrets.toml`")
+        return pd.DataFrame()
 
-# -------------------------------------------------------------------------
-# 3. Main Application Logic
-# -------------------------------------------------------------------------
+    try:
+        # 2. Initialize DirectAccess Library
+        da = DirectAccess(
+            client_id=st.secrets["enverus"]["client_id"],
+            client_secret=st.secrets["enverus"]["client_secret"]
+        )
 
-st.title("Oklahoma County Well Discovery Portal")
+        # 3. Create Spatial Filter (Bounding Box)
+        # 1 mile is approx 0.0145 degrees
+        offset = radius_miles * 0.0145
+        min_lat, max_lat = center_lat - offset, center_lat + offset
+        min_lon, max_lon = center_lon - offset, center_lon + offset
 
-# -- 3a. Search Bar (Top of Main Page) --
-search_query = st.text_input("Search Location (Section, Township, or Address)", placeholder="e.g. 123 Main St")
-
-# -- 3b. Sidebar --
-st.sidebar.header("Property Configuration")
-uploaded_file = st.sidebar.file_uploader("Upload Property Boundary (.geojson)", type=["geojson", "json"])
-
-# -------------------------------------------------------------------------
-# 4. Processing & Visualization
-# -------------------------------------------------------------------------
-
-if search_query:
-    # Append context automatically
-    full_address = f"{search_query}, Oklahoma County, OK"
-    
-    with st.spinner(f"Geocoding '{full_address}'..."):
-        lat, lon = get_location_coordinates(full_address)
-
-    if lat and lon:
-        st.success(f"Located: {lat:.4f}, {lon:.4f}")
+        # 4. Construct Query
+        query = {
+            "and": [
+                {"eq": ["StateProvince", "OK"]},
+                {"eq": ["County", "OKLAHOMA"]},
+                {"between": ["Latitude", min_lat, max_lat]},
+                {"between": ["Longitude", min_lon, max_lon]}
+            ]
+        }
         
-        # -- Prepare Target Geometry --
-        target_geometry = None
-        target_style = None
-
-        if uploaded_file:
-            try:
-                geo_data = json.load(uploaded_file)
-                # Assuming the first feature is the boundary
-                features = geo_data.get('features', [])
-                if features:
-                    target_geometry = shape(features[0]['geometry'])
-                    target_style = "polygon"
-                else:
-                    st.sidebar.warning("Invalid GeoJSON: No features found.")
-            except Exception as e:
-                st.sidebar.error(f"Error parsing GeoJSON: {e}")
+        # 5. Execute Query
+        records = list(da.query(
+            dataset="well-origins",
+            query=query,
+            fields=["WellName", "OperatorName", "ApiNumber", "TotalDepth", "Latitude", "Longitude"]
+        ))
         
-        # Fallback: Create a 10-acre box approx (approx 660x660 ft) around center if no polygon
-        if not target_geometry:
-            # 0.0018 degrees is roughly 660ft
-            offset = 0.0009 
-            target_geometry = box(lon - offset, lat - offset, lon + offset, lat + offset)
-            target_style = "box"
-            st.info("Using 10-acre fallback boundary (No GeoJSON uploaded).")
+        if not records:
+            return pd.DataFrame()
 
-        # -- Fetch Enverus Data --
-        with st.spinner("Fetching Real Enverus Data..."):
-            df_wells = fetch_enverus_data()
+        # 6. Convert to DataFrame
+        df = pd.DataFrame(records)
+        
+        # Normalize Column Names
+        df = df.rename(columns={
+            "ApiNumber": "API",
+            "OperatorName": "Operator"
+        })
+        
+        # Ensure Numeric Types
+        df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
+        df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
+        df = df.dropna(subset=['Latitude', 'Longitude'])
+        
+        return df
 
+    except Exception as e:
+        st.error(f"Enverus API Error: {str(e)}")
+        return pd.DataFrame()
+
+# -----------------------------------------------------------------------------
+# 5. MAIN APP LOGIC
+# -----------------------------------------------------------------------------
+
+def main():
+    # --- TOP NAV: SEARCH ---
+    st.title("🛢️ Oklahoma Well Discovery Portal")
+
+    col_search, _ = st.columns([2, 1])
+    with col_search:
+        raw_address = st.text_input("📍 Search Address (e.g. '2000 N Classen Blvd'):", "2000 N Classen Blvd")
+        
+        # SMART SEARCH: Auto-append Context
+        search_string = f"{raw_address}, Oklahoma County, OK"
+        st.caption(f"Searching: *{search_string}*")
+
+    # --- SIDEBAR: CONTROLS ---
+    st.sidebar.header("⚙️ Settings")
+    
+    uploaded_file = st.sidebar.file_uploader("Upload Boundary (.geojson)", type=["geojson", "json"])
+    
+    # --- PROCESSING ---
+    
+    # 1. Geocoding
+    geo_lat, geo_lon = get_lat_long_arcgis(search_string)
+    
+    final_lat, final_lon = None, None
+    
+    if geo_lat:
+        final_lat, final_lon = geo_lat, geo_lon
+    else:
+        st.warning(f"Could not find address: '{search_string}'. Using manual fallback.")
+        st.sidebar.markdown("---")
+        st.sidebar.warning("⚠️ Manual Coordinates Enabled")
+        final_lat = st.sidebar.number_input("Latitude", 35.4676, format="%.5f")
+        final_lon = st.sidebar.number_input("Longitude", -97.5164, format="%.5f")
+
+    # 2. Boundary Logic
+    if uploaded_file:
+        try:
+            data = json.load(uploaded_file)
+            feats = data.get('features', [])
+            if feats:
+                boundary_poly = shape(feats[0]['geometry'])
+                boundary_geojson = feats[0]['geometry']
+            else:
+                boundary_poly = create_fallback_boundary(final_lat, final_lon)
+                boundary_geojson = mapping(boundary_poly)
+        except:
+            st.sidebar.error("Invalid GeoJSON file.")
+            boundary_poly = create_fallback_boundary(final_lat, final_lon)
+            boundary_geojson = mapping(boundary_poly)
+    else:
+        boundary_poly = create_fallback_boundary(final_lat, final_lon)
+        boundary_geojson = mapping(boundary_poly)
+
+    # 3. Fetch Real Data
+    with st.spinner("Querying Enverus DirectAccess..."):
+        df_wells = fetch_wells_enverus(final_lat, final_lon)
+
+    # 4. Calculate Distances
+    if not df_wells.empty:
+        # Create geometry column for calculation
+        df_wells['geometry'] = df_wells.apply(lambda x: Point(x['Longitude'], x['Latitude']), axis=1)
+        # Calculate distance
+        df_wells['Dist_ft'] = df_wells['geometry'].apply(lambda x: calculate_distance_feet(x, boundary_poly)).astype(int)
+        # Sort
+        df_wells = df_wells.sort_values('Dist_ft')
+
+    # --- VISUALIZATION ---
+    st.markdown("---")
+    
+    col_map, col_stats = st.columns([3, 1])
+    
+    with col_map:
+        m = folium.Map(location=[final_lat, final_lon], zoom_start=15, tiles=None)
+        
+        # Esri Satellite
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri', name='Esri Satellite', overlay=False, control=True
+        ).add_to(m)
+        
+        # Esri Roads Overlay
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri', name='Labels', overlay=True, control=True
+        ).add_to(m)
+
+        # Property Boundary
+        folium.GeoJson(
+            boundary_geojson,
+            name="Property Boundary",
+            style_function=lambda x: {'fillColor': '#ffaf00', 'color': '#ffaf00', 'weight': 3, 'fillOpacity': 0.15}
+        ).add_to(m)
+
+        # Wells
         if not df_wells.empty:
-            # -- Distance Logic --
-            # Calculate distance from every well to the target geometry
-            df_wells['Distance_ft'] = df_wells.apply(lambda row: calculate_distance_feet(row, target_geometry), axis=1)
-            
-            # Filter: Show wells within reasonable range (e.g., 2 miles = ~10560 ft) for relevance
-            # or just sort by distance
-            df_display = df_wells.sort_values(by='Distance_ft').head(50).copy()
-
-            # -- Map Construction --
-            m = folium.Map(
-                location=[lat, lon], 
-                zoom_start=15,
-                tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                attr='Esri World Imagery'
-            )
-
-            # Draw Target Boundary
-            if target_style == "polygon" or target_style == "box":
-                # Convert shapely geom to geojson for folium
-                import shapely.geometry
-                gjson = shapely.geometry.mapping(target_geometry)
-                
-                folium.GeoJson(
-                    gjson,
-                    name="Property Boundary",
-                    style_function=lambda x: {'fillColor': '#000080', 'color': '#1E90FF', 'weight': 2, 'fillOpacity': 0.2}
-                ).add_to(m)
-
-            # Draw Search Center Marker
-            folium.Marker(
-                [lat, lon],
-                popup="Search Center",
-                icon=folium.Icon(color="red", icon="info-sign")
-            ).add_to(m)
-
-            # Draw Wells
-            for _, row in df_display.iterrows():
-                # Color code based on distance (Green close, Red far)
-                color = 'green' if row['Distance_ft'] < 1000 else 'orange' if row['Distance_ft'] < 5000 else 'blue'
+            for _, row in df_wells.iterrows():
+                # Green if inside (dist=0), Blue if outside
+                color = "#00ff00" if row['Dist_ft'] == 0 else "#1E90FF"
                 
                 folium.CircleMarker(
                     location=[row['Latitude'], row['Longitude']],
-                    radius=5,
-                    popup=f"<b>{row['WellName']}</b><br>Op: {row['OperatorName']}<br>Dist: {row['Distance_ft']} ft",
-                    color=color,
-                    fill=True,
-                    fill_opacity=0.7
+                    radius=6,
+                    color="white", weight=1,
+                    fill=True, fill_color=color, fill_opacity=0.9,
+                    popup=folium.Popup(f"<b>{row['WellName']}</b><br>Op: {row['Operator']}<br>Dist: {row['Dist_ft']} ft", max_width=250)
                 ).add_to(m)
 
-            # Render Map
-            st_folium(m, width="100%", height=500)
+        folium.LayerControl().add_to(m)
+        MeasureControl(position='bottomleft').add_to(m)
+        st_folium(m, height=600, width=None)
 
-            # -- Data Table --
-            st.subheader("Nearby Wells (Enverus Data)")
-            
-            # Formatting for display
-            display_cols = ['WellName', 'OperatorName', 'API', 'TotalDepth', 'Distance_ft']
-            
-            # Gradient styling for Distance column
+    with col_stats:
+        st.subheader("Analysis Results")
+        
+        count_on = 0
+        count_near = 0
+        nearest_txt = "N/A"
+        nearest_dist = 0
+        
+        if not df_wells.empty:
+            count_on = len(df_wells[df_wells['Dist_ft'] == 0])
+            count_near = len(df_wells)
+            nearest_row = df_wells.iloc[0]
+            nearest_txt = nearest_row['WellName']
+            nearest_dist = nearest_row['Dist_ft']
+
+        st.metric("Wells ON Property", count_on)
+        st.metric("Wells Nearby (View)", count_near)
+        
+        st.markdown("---")
+        st.markdown(f"**Nearest Well:**")
+        st.info(f"{nearest_txt}")
+        st.markdown(f"**Distance:** {nearest_dist} ft")
+
+    # --- DATA TABLE ---
+    st.subheader("Detailed Well List")
+    
+    if not df_wells.empty:
+        display_cols = ['WellName', 'Operator', 'API', 'TotalDepth', 'Dist_ft']
+        
+        try:
             st.dataframe(
-                df_display[display_cols].style.background_gradient(subset=['Distance_ft'], cmap="Blues"),
+                df_wells[display_cols].style.background_gradient(subset=['Dist_ft'], cmap="Blues"),
                 use_container_width=True
             )
-
-        else:
-            st.warning("No Wells found in Oklahoma County via Enverus Connection.")
-
+        except Exception:
+            st.dataframe(df_wells[display_cols], use_container_width=True)
     else:
-        st.error("Could not geocode location. Please try a different query.")
+        st.info("No wells found in this area (Enverus Data).")
 
-else:
-    # Initial State
-    st.info("Enter a location above to begin discovery.")
+if __name__ == "__main__":
+    main()
