@@ -1,4 +1,5 @@
 streamlit
+directaccess
 enverus_developer_api
 shapely
 geopy
