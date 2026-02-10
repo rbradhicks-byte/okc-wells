@@ -9,7 +9,7 @@ import pandas as pd
 import json
 
 # -----------------------------------------------------------------------------
-# 1. CONFIGURATION & PAGE SETUP
+# 1. CONFIGURATION & THEME SETUP
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="OKC Well Proximity Portal",
@@ -17,11 +17,34 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS
+# Custom CSS for Navy & Blue Theme
 st.markdown("""
     <style>
-    .stApp { background-color: #f0f2f6; }
-    div[data-testid="stMetricValue"] { font-size: 24px; color: #004e8c; }
+    /* Main Background */
+    .stApp { background-color: #f8f9fa; }
+    
+    /* Headers (Navy Blue) */
+    h1, h2, h3 {
+        color: #000080 !important;
+        font-weight: 700 !important;
+    }
+    
+    /* Metrics & Sub-labels (Sky Blue / Navy combo) */
+    div[data-testid="stMetricLabel"] {
+        color: #1E90FF !important; /* Sky Blue */
+        font-weight: bold;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #000080 !important; /* Navy Blue */
+        font-size: 28px !important;
+    }
+    
+    /* Borders for clarity */
+    div[data-testid="stForm"] {
+        border: 2px solid #000080;
+        border-radius: 10px;
+        padding: 20px;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -33,7 +56,6 @@ st.markdown("""
 def get_lat_long_arcgis(address):
     """
     Geocodes address using Esri ArcGIS.
-    More reliable on Cloud IPs than Nominatim.
     """
     try:
         # User-Agent defined as requested
@@ -43,7 +65,6 @@ def get_lat_long_arcgis(address):
             return location.latitude, location.longitude
         return None, None
     except Exception as e:
-        # Return None to trigger manual fallback in UI
         return None, None
 
 def create_fallback_boundary(lat, lon):
@@ -91,7 +112,7 @@ def fetch_wells_nearby(lat, lon):
     """Fetches wells from Enverus or generates Mock Data."""
     token = get_enverus_token()
     
-    # MOCK DATA (If API fails or no secrets)
+    # MOCK DATA
     if token == "MOCK" or not token:
         import random
         mock_data = []
@@ -141,33 +162,42 @@ def fetch_wells_nearby(lat, lon):
 # -----------------------------------------------------------------------------
 
 def main():
-    st.sidebar.title("🛢️ Discovery Portal")
+    # --- HEADER & SEARCH (MAIN PAGE) ---
+    st.title("🛢️ Oklahoma Well Proximity Portal")
     
-    # --- INPUTS ---
-    address_input = st.sidebar.text_input("Target Address:", "2000 N Classen Blvd, Oklahoma City, OK")
-    
-    # Try Geocoding
-    geo_lat, geo_lon = get_lat_long_arcgis(address_input)
-    
-    final_lat = None
-    final_lon = None
-    
-    # LOGIC: If geocoding worked, use it. If failed, show manual inputs.
-    if geo_lat is not None:
-        final_lat = geo_lat
-        final_lon = geo_lon
-    else:
-        st.sidebar.error("⚠️ Geocoding failed or address not found.")
-        st.sidebar.markdown("**Enter Coordinates Manually:**")
-        # Defaults set to OKC Center so map renders somewhere meaningful
-        final_lat = st.sidebar.number_input("Latitude", value=35.4676, format="%.5f")
-        final_lon = st.sidebar.number_input("Longitude", value=-97.5164, format="%.5f")
+    col_search, col_padding = st.columns([2, 1])
+    with col_search:
+        # Search Bar moved to main page
+        address_raw = st.text_input("📍 Enter Street Address (e.g., '2000 N Classen Blvd')", "2000 N Classen Blvd")
+        
+        # Smart Search: Auto-append Context
+        full_address = f"{address_raw}, Oklahoma County, OK"
+        st.caption(f"Searching for: *{full_address}*")
 
+    # --- SIDEBAR: BOUNDARY & FALLBACKS ---
+    st.sidebar.header("Settings")
     uploaded_file = st.sidebar.file_uploader("Upload Property Boundary (.geojson)", type=["geojson", "json"])
     
     # --- PROCESSING ---
     
-    # 1. Define Boundary
+    # 1. Attempt Geocoding
+    geo_lat, geo_lon = get_lat_long_arcgis(full_address)
+    
+    final_lat = None
+    final_lon = None
+    
+    # 2. Coordinate Logic (Auto vs Manual)
+    if geo_lat is not None:
+        final_lat = geo_lat
+        final_lon = geo_lon
+    else:
+        st.error(f"Could not find address: '{full_address}'. Please enter coordinates manually in the sidebar.")
+        st.sidebar.markdown("---")
+        st.sidebar.error("⚠️ Manual Fallback Mode")
+        final_lat = st.sidebar.number_input("Manual Latitude", value=35.4676, format="%.5f")
+        final_lon = st.sidebar.number_input("Manual Longitude", value=-97.5164, format="%.5f")
+
+    # 3. Define Boundary
     if uploaded_file:
         try:
             geo_data = json.load(uploaded_file)
@@ -186,16 +216,17 @@ def main():
         boundary_poly = create_fallback_boundary(final_lat, final_lon)
         boundary_geojson = mapping(boundary_poly)
 
-    # 2. Fetch Data
+    # 4. Fetch Data
     df_wells = fetch_wells_nearby(final_lat, final_lon)
     
-    # 3. Math
+    # 5. Math
     if not df_wells.empty:
         df_wells['geometry'] = df_wells.apply(lambda x: Point(x['Longitude'], x['Latitude']), axis=1)
         df_wells['Dist_to_Prop_ft'] = df_wells['geometry'].apply(lambda x: calculate_distance_feet(x, boundary_poly)).astype(int)
         df_wells = df_wells.sort_values('Dist_to_Prop_ft')
 
     # --- MAP VISUALIZATION ---
+    st.markdown("---")
     
     m = folium.Map(location=[final_lat, final_lon], zoom_start=15, tiles=None)
 
@@ -227,7 +258,7 @@ def main():
     # Draw Center Marker
     folium.Marker(
         [final_lat, final_lon], 
-        popup="Target Location",
+        popup="Subject Property",
         icon=folium.Icon(color="red", icon="home")
     ).add_to(m)
 
@@ -250,7 +281,6 @@ def main():
     MeasureControl(position='bottomleft').add_to(m)
 
     # --- DASHBOARD LAYOUT ---
-    st.title("Oklahoma Well Proximity Portal")
     
     col1, col2 = st.columns([3, 1])
     
@@ -259,18 +289,38 @@ def main():
     
     with col2:
         st.subheader("Analysis")
-        count_on = len(df_wells[df_wells['Dist_to_Prop_ft'] == 0])
+        
+        count_on = 0
+        count_near = 0
+        
+        if not df_wells.empty:
+            count_on = len(df_wells[df_wells['Dist_to_Prop_ft'] == 0])
+            count_near = len(df_wells)
+
         st.metric("Wells ON Property", count_on)
-        st.metric("Wells Nearby (1mi)", len(df_wells))
+        st.metric("Wells Nearby (1mi)", count_near)
         
         if not df_wells.empty:
             nearest = df_wells.iloc[0]
             st.info(f"**Nearest Well:**\n\n{nearest['WellName']}\n\n{nearest['Dist_to_Prop_ft']} ft away")
 
+    # --- DATA TABLE ---
     st.subheader("Well Data Table")
+    
     if not df_wells.empty:
         display_cols = ['WellName', 'Operator', 'API', 'Status', 'Dist_to_Prop_ft']
-        st.dataframe(df_wells[display_cols].style.background_gradient(subset=['Dist_to_Prop_ft'], cmap="RdYlGn_r"), use_container_width=True)
+        
+        # Robust styling block
+        try:
+            st.dataframe(
+                df_wells[display_cols].style.background_gradient(subset=['Dist_to_Prop_ft'], cmap="Blues"), 
+                use_container_width=True
+            )
+        except Exception:
+            # Fallback if matplotlib or styling fails
+            st.dataframe(df_wells[display_cols], use_container_width=True)
+    else:
+        st.info("No wells found in this area.")
 
 if __name__ == "__main__":
     main()
