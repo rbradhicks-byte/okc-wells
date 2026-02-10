@@ -5,3 +5,4 @@ geopy
 pandas
 folium
 streamlit-folium
+matplotlib
