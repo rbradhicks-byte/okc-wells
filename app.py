@@ -51,7 +51,8 @@ def fetch_enverus_data():
         
         d2 = DirectAccessV2(
             client_id=creds["client_id"],
-            client_secret=creds["client_secret"]
+            client_secret=creds["client_secret"],
+            api_key=creds["api_key"]
         )
 
         # Dataset: well-origins (or 'wells' depending on subscription)
