@@ -4,46 +4,62 @@ from streamlit_folium import st_folium
 from folium.plugins import MeasureControl
 from geopy.geocoders import ArcGIS
 from shapely.geometry import shape, Point, box, mapping
-import requests
 import pandas as pd
 import json
 
+# Import Enverus Library
+try:
+    from enverus_developer_api import DirectAccess
+except ImportError:
+    st.error("Missing Library: Please run `pip install enverus-developer-api`")
+    st.stop()
+
 # -----------------------------------------------------------------------------
-# 1. CONFIGURATION & THEME SETUP
+# 1. CONFIGURATION & THEME
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="OKC Well Proximity Portal",
+    page_title="OKC Well Discovery Portal",
     page_icon="🛢️",
     layout="wide"
 )
 
-# Custom CSS for Navy & Blue Theme
+# PRODUCTION CSS: Navy (#000080) & Sky Blue (#1E90FF) Theme
 st.markdown("""
     <style>
-    /* Main Background */
-    .stApp { background-color: #f8f9fa; }
+    /* Global Background */
+    .stApp { background-color: #f4f6f9; }
     
-    /* Headers (Navy Blue) */
-    h1, h2, h3 {
+    /* Headers - Force Navy Blue */
+    h1, h2, h3, h4, h5 {
         color: #000080 !important;
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        font-weight: 800 !important;
+    }
+    
+    /* Metrics - The Label (e.g., 'Wells ON Property') */
+    div[data-testid="stMetricLabel"] {
+        color: #000080 !important; 
+        font-size: 16px !important;
         font-weight: 700 !important;
     }
     
-    /* Metrics & Sub-labels (Sky Blue / Navy combo) */
-    div[data-testid="stMetricLabel"] {
-        color: #1E90FF !important; /* Sky Blue */
-        font-weight: bold;
-    }
+    /* Metrics - The Value (e.g., '12') */
     div[data-testid="stMetricValue"] {
-        color: #000080 !important; /* Navy Blue */
-        font-size: 28px !important;
+        color: #1E90FF !important;
+        font-size: 32px !important;
+        font-weight: 700 !important;
     }
     
-    /* Borders for clarity */
-    div[data-testid="stForm"] {
-        border: 2px solid #000080;
-        border-radius: 10px;
-        padding: 20px;
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #e6eaee;
+    }
+    
+    /* Buttons */
+    div.stButton > button {
+        background-color: #000080;
+        color: white;
+        border-radius: 8px;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -53,274 +69,260 @@ st.markdown("""
 # -----------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def get_lat_long_arcgis(address):
+def get_lat_long_arcgis(address_str):
     """
-    Geocodes address using Esri ArcGIS.
+    Geocodes using Esri ArcGIS.
+    Automatically handles errors to prevent app crashes.
     """
     try:
-        # User-Agent defined as requested
-        geolocator = ArcGIS(user_agent="okc_discovery_portal_v1", timeout=5)
-        location = geolocator.geocode(address)
+        geolocator = ArcGIS(user_agent="okc_discovery_portal_prod", timeout=5)
+        location = geolocator.geocode(address_str)
         if location:
             return location.latitude, location.longitude
         return None, None
-    except Exception as e:
+    except Exception:
         return None, None
 
 def create_fallback_boundary(lat, lon):
-    """Creates a ~10 acre square box around the center point."""
+    """Creates a ~10 acre box (approx 200m x 200m) around the point."""
     delta = 0.002
     minx, miny = lon - delta, lat - delta
     maxx, maxy = lon + delta, lat + delta
     return box(minx, miny, maxx, maxy)
 
 def calculate_distance_feet(point_geom, poly_geom):
-    """Calculates distance (0 if inside). 1 Degree approx 364k ft."""
+    """Calculates distance in feet (0 if inside)."""
     if poly_geom.contains(point_geom):
         return 0.0
-    dist_degrees = poly_geom.distance(point_geom)
-    feet_per_degree = 364000 
-    return dist_degrees * feet_per_degree
+    # Approx conversion at OK latitudes (35N)
+    # 1 deg lat ~= 364,000 ft
+    return poly_geom.distance(point_geom) * 364000 
 
 # -----------------------------------------------------------------------------
-# 3. ENVERUS DATA INTEGRATION
+# 3. ENVERUS DATA INTEGRATION (REAL API)
 # -----------------------------------------------------------------------------
-
-def get_enverus_token():
-    try:
-        if "enverus" not in st.secrets:
-            return "MOCK"
-            
-        url = "https://api.enverus.com/v3/direct-access/tokens"
-        payload = {
-            "grantType": "client_credentials",
-            "clientId": st.secrets["enverus"]["client_id"],
-            "clientSecret": st.secrets["enverus"]["client_secret"],
-            "scope": "limited"
-        }
-        headers = {"Content-Type": "application/json"}
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
-        
-        if response.status_code == 200:
-            return response.json().get('token')
-        return "MOCK"
-    except:
-        return "MOCK"
 
 @st.cache_data(ttl=3600)
-def fetch_wells_nearby(lat, lon):
-    """Fetches wells from Enverus or generates Mock Data."""
-    token = get_enverus_token()
-    
-    # MOCK DATA
-    if token == "MOCK" or not token:
-        import random
-        mock_data = []
-        for i in range(5):
-            r_lat = lat + random.uniform(-0.01, 0.01)
-            r_lon = lon + random.uniform(-0.01, 0.01)
-            mock_data.append({
-                "WellName": f"MOCK WELL {i+1}H",
-                "Operator": "OKLAHOMA ENERGY DEV",
-                "API": f"350001234{i}",
-                "Latitude": r_lat,
-                "Longitude": r_lon,
-                "Status": "ACTIVE"
-            })
-        return pd.DataFrame(mock_data)
-
-    # REAL API CALL
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    offset = 0.02
-    query = {
-        "dataset": "wells",
-        "query": {
-            "and": [
-                {"greaterThan": ["Latitude", lat - offset]},
-                {"lessThan": ["Latitude", lat + offset]},
-                {"greaterThan": ["Longitude", lon - offset]},
-                {"lessThan": ["Longitude", lon + offset]},
-                {"in": ["WellStatus", ["ACTIVE", "COMPLETED", "DRILLING"]]} 
-            ]
-        },
-        "fields": ["API", "WellName", "OperatorAlias", "Latitude", "Longitude", "WellStatus"],
-        "pageSize": 100
-    }
-    
-    try:
-        url = "https://api.enverus.com/v3/direct-access/query"
-        resp = requests.post(url, headers=headers, json=query, timeout=10)
-        if resp.status_code == 200:
-            df = pd.DataFrame(resp.json())
-            return df.rename(columns={"OperatorAlias": "Operator", "WellStatus": "Status"})
+def fetch_wells_enverus(center_lat, center_lon, radius_miles=2):
+    """
+    Queries Enverus DirectAccess (well-origins).
+    Filters: State=OK, County=OKLAHOMA.
+    Optimization: Adds a Bounding Box filter to prevent fetching 50k wells.
+    """
+    # 1. Check Credentials
+    if "enverus" not in st.secrets:
+        st.error("Enverus credentials missing in .streamlit/secrets.toml")
         return pd.DataFrame()
-    except:
+
+    try:
+        # 2. Initialize DirectAccess Library
+        da = DirectAccess(
+            client_id=st.secrets["enverus"]["client_id"],
+            client_secret=st.secrets["enverus"]["client_secret"]
+        )
+
+        # 3. Create Spatial Filter (Bounding Box) for Performance
+        # 1 mile is approx 0.0145 degrees
+        offset = radius_miles * 0.0145
+        min_lat, max_lat = center_lat - offset, center_lat + offset
+        min_lon, max_lon = center_lon - offset, center_lon + offset
+
+        # 4. Construct Query
+        # We look for wells in Oklahoma County AND within our visual box
+        query = {
+            "and": [
+                {"eq": ["StateProvince", "OK"]},
+                {"eq": ["County", "OKLAHOMA"]},
+                {"between": ["Latitude", min_lat, max_lat]},
+                {"between": ["Longitude", min_lon, max_lon]}
+            ]
+        }
+        
+        # 5. Execute Query
+        # Using 'well-origins' dataset as requested
+        records = da.query(
+            dataset="well-origins",
+            query=query,
+            fields=["WellName", "OperatorName", "ApiNumber", "TotalDepth", "Latitude", "Longitude"]
+        )
+        
+        if not records:
+            return pd.DataFrame()
+
+        # 6. Convert to DataFrame
+        df = pd.DataFrame(records)
+        
+        # Normalize Column Names for UI
+        df = df.rename(columns={
+            "ApiNumber": "API",
+            "OperatorName": "Operator"
+        })
+        
+        # Ensure Numeric Types
+        df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
+        df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
+        df = df.dropna(subset=['Latitude', 'Longitude'])
+        
+        return df
+
+    except Exception as e:
+        st.error(f"Enverus API Error: {str(e)}")
         return pd.DataFrame()
 
 # -----------------------------------------------------------------------------
-# 4. MAIN UI LOGIC
+# 4. MAIN APP LOGIC
 # -----------------------------------------------------------------------------
 
 def main():
-    # --- HEADER & SEARCH (MAIN PAGE) ---
-    st.title("🛢️ Oklahoma Well Proximity Portal")
-    
-    col_search, col_padding = st.columns([2, 1])
-    with col_search:
-        # Search Bar moved to main page
-        address_raw = st.text_input("📍 Enter Street Address (e.g., '2000 N Classen Blvd')", "2000 N Classen Blvd")
-        
-        # Smart Search: Auto-append Context
-        full_address = f"{address_raw}, Oklahoma County, OK"
-        st.caption(f"Searching for: *{full_address}*")
+    # --- TOP NAV: SEARCH ---
+    st.title("🛢️ Oklahoma Well Discovery Portal")
 
-    # --- SIDEBAR: BOUNDARY & FALLBACKS ---
-    st.sidebar.header("Settings")
-    uploaded_file = st.sidebar.file_uploader("Upload Property Boundary (.geojson)", type=["geojson", "json"])
+    col_search, _ = st.columns([2, 1])
+    with col_search:
+        raw_address = st.text_input("📍 Search Address (e.g. '2000 N Classen Blvd'):", "2000 N Classen Blvd")
+        
+        # SMART SEARCH: Auto-append Context
+        search_string = f"{raw_address}, Oklahoma County, OK"
+        st.caption(f"Searching: *{search_string}*")
+
+    # --- SIDEBAR: CONTROLS ---
+    st.sidebar.header("⚙️ Settings")
+    
+    uploaded_file = st.sidebar.file_uploader("Upload Boundary (.geojson)", type=["geojson", "json"])
     
     # --- PROCESSING ---
     
-    # 1. Attempt Geocoding
-    geo_lat, geo_lon = get_lat_long_arcgis(full_address)
+    # 1. Geocoding
+    geo_lat, geo_lon = get_lat_long_arcgis(search_string)
     
-    final_lat = None
-    final_lon = None
+    final_lat, final_lon = None, None
     
-    # 2. Coordinate Logic (Auto vs Manual)
-    if geo_lat is not None:
-        final_lat = geo_lat
-        final_lon = geo_lon
+    if geo_lat:
+        final_lat, final_lon = geo_lat, geo_lon
     else:
-        st.error(f"Could not find address: '{full_address}'. Please enter coordinates manually in the sidebar.")
+        st.warning(f"Could not find address: '{search_string}'. Using manual fallback.")
         st.sidebar.markdown("---")
-        st.sidebar.error("⚠️ Manual Fallback Mode")
-        final_lat = st.sidebar.number_input("Manual Latitude", value=35.4676, format="%.5f")
-        final_lon = st.sidebar.number_input("Manual Longitude", value=-97.5164, format="%.5f")
+        st.sidebar.warning("⚠️ Manual Coordinates Enabled")
+        final_lat = st.sidebar.number_input("Latitude", 35.4676, format="%.5f")
+        final_lon = st.sidebar.number_input("Longitude", -97.5164, format="%.5f")
 
-    # 3. Define Boundary
+    # 2. Boundary Logic
     if uploaded_file:
         try:
-            geo_data = json.load(uploaded_file)
-            features = geo_data.get('features', [])
-            if features:
-                boundary_poly = shape(features[0]['geometry'])
-                boundary_geojson = features[0]['geometry']
+            data = json.load(uploaded_file)
+            feats = data.get('features', [])
+            if feats:
+                boundary_poly = shape(feats[0]['geometry'])
+                boundary_geojson = feats[0]['geometry']
             else:
                 boundary_poly = create_fallback_boundary(final_lat, final_lon)
                 boundary_geojson = mapping(boundary_poly)
-        except Exception as e:
-            st.error(f"Error reading file: {e}")
+        except:
+            st.sidebar.error("Invalid GeoJSON file.")
             boundary_poly = create_fallback_boundary(final_lat, final_lon)
             boundary_geojson = mapping(boundary_poly)
     else:
         boundary_poly = create_fallback_boundary(final_lat, final_lon)
         boundary_geojson = mapping(boundary_poly)
 
-    # 4. Fetch Data
-    df_wells = fetch_wells_nearby(final_lat, final_lon)
-    
-    # 5. Math
-    if not df_wells.empty:
-        df_wells['geometry'] = df_wells.apply(lambda x: Point(x['Longitude'], x['Latitude']), axis=1)
-        df_wells['Dist_to_Prop_ft'] = df_wells['geometry'].apply(lambda x: calculate_distance_feet(x, boundary_poly)).astype(int)
-        df_wells = df_wells.sort_values('Dist_to_Prop_ft')
+    # 3. Fetch Real Data
+    with st.spinner("Querying Enverus DirectAccess..."):
+        df_wells = fetch_wells_enverus(final_lat, final_lon)
 
-    # --- MAP VISUALIZATION ---
+    # 4. Calculate Distances
+    if not df_wells.empty:
+        # Create geometry column for calculation
+        df_wells['geometry'] = df_wells.apply(lambda x: Point(x['Longitude'], x['Latitude']), axis=1)
+        # Calculate distance
+        df_wells['Dist_ft'] = df_wells['geometry'].apply(lambda x: calculate_distance_feet(x, boundary_poly)).astype(int)
+        # Sort
+        df_wells = df_wells.sort_values('Dist_ft')
+
+    # --- VISUALIZATION ---
     st.markdown("---")
     
-    m = folium.Map(location=[final_lat, final_lon], zoom_start=15, tiles=None)
-
-    # Esri World Imagery (Satellite)
-    folium.TileLayer(
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-        attr='Esri',
-        name='Esri Satellite',
-        overlay=False,
-        control=True
-    ).add_to(m)
-
-    # Esri Labels (Roads/Reference)
-    folium.TileLayer(
-        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
-        attr='Esri',
-        name='Esri Labels',
-        overlay=True,
-        control=True
-    ).add_to(m)
-
-    # Draw Boundary
-    folium.GeoJson(
-        boundary_geojson,
-        name="Property Boundary",
-        style_function=lambda x: {'fillColor': '#ffaf00', 'color': '#ffaf00', 'weight': 2, 'fillOpacity': 0.2}
-    ).add_to(m)
-
-    # Draw Center Marker
-    folium.Marker(
-        [final_lat, final_lon], 
-        popup="Subject Property",
-        icon=folium.Icon(color="red", icon="home")
-    ).add_to(m)
-
-    # Draw Wells
-    if not df_wells.empty:
-        for _, row in df_wells.iterrows():
-            color = "green" if row['Dist_to_Prop_ft'] == 0 else "blue"
-            folium.CircleMarker(
-                location=[row['Latitude'], row['Longitude']],
-                radius=6,
-                color="white",
-                weight=1,
-                fill=True,
-                fill_color=color,
-                fill_opacity=1,
-                popup=folium.Popup(f"<b>{row['WellName']}</b><br>Dist: {row['Dist_to_Prop_ft']} ft", max_width=250)
-            ).add_to(m)
-
-    folium.LayerControl().add_to(m)
-    MeasureControl(position='bottomleft').add_to(m)
-
-    # --- DASHBOARD LAYOUT ---
+    # Layout: Map (Left) vs Stats (Right)
+    col_map, col_stats = st.columns([3, 1])
     
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
+    with col_map:
+        m = folium.Map(location=[final_lat, final_lon], zoom_start=15, tiles=None)
+        
+        # Esri Satellite
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri', name='Esri Satellite', overlay=False, control=True
+        ).add_to(m)
+        
+        # Esri Roads Overlay (Essential for context)
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri', name='Labels', overlay=True, control=True
+        ).add_to(m)
+
+        # Property Boundary
+        folium.GeoJson(
+            boundary_geojson,
+            name="Property Boundary",
+            style_function=lambda x: {'fillColor': '#ffaf00', 'color': '#ffaf00', 'weight': 3, 'fillOpacity': 0.15}
+        ).add_to(m)
+
+        # Wells
+        if not df_wells.empty:
+            for _, row in df_wells.iterrows():
+                # Green if inside (dist=0), Blue if outside
+                color = "#00ff00" if row['Dist_ft'] == 0 else "#1E90FF"
+                
+                folium.CircleMarker(
+                    location=[row['Latitude'], row['Longitude']],
+                    radius=6,
+                    color="white", weight=1,
+                    fill=True, fill_color=color, fill_opacity=0.9,
+                    popup=folium.Popup(f"<b>{row['WellName']}</b><br>Op: {row['Operator']}<br>Dist: {row['Dist_ft']} ft", max_width=250)
+                ).add_to(m)
+
+        folium.LayerControl().add_to(m)
+        MeasureControl(position='bottomleft').add_to(m)
         st_folium(m, height=600, width=None)
-    
-    with col2:
-        st.subheader("Analysis")
+
+    with col_stats:
+        st.subheader("Analysis Results")
         
         count_on = 0
         count_near = 0
+        nearest_txt = "N/A"
+        nearest_dist = 0
         
         if not df_wells.empty:
-            count_on = len(df_wells[df_wells['Dist_to_Prop_ft'] == 0])
+            count_on = len(df_wells[df_wells['Dist_ft'] == 0])
             count_near = len(df_wells)
+            nearest_row = df_wells.iloc[0]
+            nearest_txt = nearest_row['WellName']
+            nearest_dist = nearest_row['Dist_ft']
 
         st.metric("Wells ON Property", count_on)
-        st.metric("Wells Nearby (1mi)", count_near)
+        st.metric("Wells Nearby (View)", count_near)
         
-        if not df_wells.empty:
-            nearest = df_wells.iloc[0]
-            st.info(f"**Nearest Well:**\n\n{nearest['WellName']}\n\n{nearest['Dist_to_Prop_ft']} ft away")
+        st.markdown("---")
+        st.markdown(f"**Nearest Well:**")
+        st.info(f"{nearest_txt}")
+        st.markdown(f"**Distance:** {nearest_dist} ft")
 
     # --- DATA TABLE ---
-    st.subheader("Well Data Table")
+    st.subheader("Detailed Well List")
     
     if not df_wells.empty:
-        display_cols = ['WellName', 'Operator', 'API', 'Status', 'Dist_to_Prop_ft']
+        display_cols = ['WellName', 'Operator', 'API', 'TotalDepth', 'Dist_ft']
         
-        # Robust styling block
+        # Robust Styling (Try/Except)
         try:
             st.dataframe(
-                df_wells[display_cols].style.background_gradient(subset=['Dist_to_Prop_ft'], cmap="Blues"), 
+                df_wells[display_cols].style.background_gradient(subset=['Dist_ft'], cmap="Blues"),
                 use_container_width=True
             )
         except Exception:
-            # Fallback if matplotlib or styling fails
             st.dataframe(df_wells[display_cols], use_container_width=True)
     else:
-        st.info("No wells found in this area.")
+        st.info("No wells found in this area (Enverus Data).")
 
 if __name__ == "__main__":
     main()
