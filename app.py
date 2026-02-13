@@ -24,7 +24,7 @@ st.markdown(
         color: {NAVY_BLUE} !important;
         font-weight: bold;
     }}
-    /* Adjust button alignment in form */
+    /* Remove padding from form container to align button */
     div[data-testid="stForm"] {{
         border: none;
         padding: 0;
@@ -46,47 +46,57 @@ st.title("🛢️ Oklahoma County Well Discovery Portal")
 @st.cache_resource
 def get_enverus_client():
     """
-    Initialize Enverus client.
-    FIX: Provides a dummy 'api_key' to satisfy library constructor validation
-    while using client_id/secret for actual OAuth authentication.
+    Initialize Enverus client using DirectAccessV2.
+    Uses a dummy API key to bypass library validation while strictly using
+    OAuth Client Credentials (ID + Secret) for the actual connection.
     """
     try:
         creds = st.secrets["enverus"]
         c_id = creds.get("client_id")
         c_secret = creds.get("client_secret")
         
-        # FIX: Pass a dummy string if api_key is missing to bypass library checks
-        # The library prioritizes ID/Secret for token generation if they are present.
+        # Pass dummy key to satisfy constructor; library will use ID/Secret for token
         c_key = creds.get("api_key", "NOT_REQUIRED")
         
         d2 = DirectAccessV2(client_id=c_id, client_secret=c_secret, api_key=c_key)
         return d2
     except Exception as e:
-        st.error(f"Authentication Error: {e}")
+        st.error(f"Authentication Config Error: {e}")
         return None
 
 @st.cache_data(ttl=3600)
 def fetch_ok_wells(_client):
     """
     Fetch well-origins for Oklahoma County, OK.
-    Cached for 1 hour.
+    Uses specific query parameters supported by Direct Access V2.
     """
     if not _client:
         return pd.DataFrame()
 
     try:
-        query = _client.query("well-origins", 
-                              filters={"State": "OK", "County": "OKLAHOMA"},
-                              headers={"Accept": "application/json"})
+        # UPDATED QUERY LOGIC:
+        # Removed 'filters' dict and 'headers'. 
+        # Passed params directly as kwargs: county, state_province, deleteddate.
+        query_generator = _client.query(
+            "well-origins", 
+            county='OKLAHOMA', 
+            state_province='OK', 
+            deleteddate='null'
+        )
         
-        df = pd.DataFrame(query)
+        # Generator to DataFrame
+        df = pd.DataFrame(list(query_generator))
         
-        if not df.empty and 'SurfaceLatitude' in df.columns and 'SurfaceLongitude' in df.columns:
-            df = df.dropna(subset=['SurfaceLatitude', 'SurfaceLongitude'])
+        # UPDATED FIELD MAPPING:
+        # Ensure we have the coordinate columns (Latitude/Longitude)
+        if not df.empty and 'Latitude' in df.columns and 'Longitude' in df.columns:
+            df = df.dropna(subset=['Latitude', 'Longitude'])
             return df
+            
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"Data Fetch Error: {e}")
+        # Catch specific API errors
+        st.error(f"Enverus API Error: {e}")
         return pd.DataFrame()
 
 def get_location_coordinates(address):
@@ -117,13 +127,12 @@ with st.sidebar:
 # 4. MAIN LAYOUT
 # -----------------------------------------------------------------------------
 
-# FIX: Wrap inputs in a form to enable "Enter key" submission
+# Search Form Wrapper (Enter Key Support)
 with st.form("search_form"):
     search_col1, search_col2 = st.columns([3, 1])
     with search_col1:
         user_address = st.text_input("Search Location", placeholder="e.g. 320 Robert S Kerr Ave")
     with search_col2:
-        # Use st.form_submit_button inside the form
         submit_btn = st.form_submit_button("Analyze Location", type="primary", use_container_width=True)
 
 if submit_btn and user_address:
@@ -161,14 +170,14 @@ if submit_btn and user_address:
         client = get_enverus_client()
         
         if client:
-            with st.spinner("Fetching Enverus Well Data..."):
+            with st.spinner("Fetching Data from Enverus..."):
                 wells_df = fetch_ok_wells(client)
 
             if not wells_df.empty:
-                # Convert Wells to GeoDataFrame
+                # UPDATED GEOMETRY: Using 'Longitude' and 'Latitude' columns
                 wells_gdf = gpd.GeoDataFrame(
                     wells_df,
-                    geometry=gpd.points_from_xy(wells_df.SurfaceLongitude, wells_df.SurfaceLatitude),
+                    geometry=gpd.points_from_xy(wells_df.Longitude, wells_df.Latitude),
                     crs="EPSG:4326"
                 )
 
@@ -176,7 +185,7 @@ if submit_btn and user_address:
                 projected_aoi = aoi_gdf.to_crs("EPSG:32124")
                 projected_wells = wells_gdf.to_crs("EPSG:32124")
                 
-                # Filter wells within ~3km buffer
+                # Filter wells within 10,000ft (approx 3km) buffer
                 buffer_area = projected_aoi.buffer(10000).geometry.iloc[0]
                 mask = projected_wells.within(buffer_area)
                 nearby_wells = projected_wells[mask].copy()
@@ -230,13 +239,18 @@ if submit_btn and user_address:
 
                     # Wells (Cyan with Navy Fill)
                     for _, row in display_wells.iterrows():
+                        # Handle potential missing fields gracefully for popup
+                        wn = row.get('WellName', 'Unknown')
+                        api = row.get('API_UWI_14', 'N/A')
+                        op = row.get('OperatorName', 'N/A')
+                        
                         folium.CircleMarker(
                             location=[row.geometry.y, row.geometry.x],
                             radius=5,
                             color='#00FFFF',
                             fill=True,
                             fill_color=NAVY_BLUE, 
-                            popup=folium.Popup(f"<b>{row['WellName']}</b><br>API: {row['API']}<br>Op: {row['OperatorName']}", max_width=250)
+                            popup=folium.Popup(f"<b>{wn}</b><br>API: {api}<br>Op: {op}", max_width=250)
                         ).add_to(m)
 
                     st_folium(m, width="100%", height=500)
@@ -245,10 +259,13 @@ if submit_btn and user_address:
                 with col_data:
                     st.subheader("Well Inventory")
                     
-                    table_cols = ['WellName', 'OperatorName', 'API', 'TotalDepth', 'Distance_ft']
+                    # UPDATED COLUMN NAMES
+                    target_cols = ['WellName', 'OperatorName', 'API_UWI_14', 'TotalDepth', 'Distance_ft']
+                    
                     display_df = pd.DataFrame(display_wells)
-                    valid_cols = [c for c in table_cols if c in display_df.columns]
-                    final_df = display_df[valid_cols].copy()
+                    # Filter for columns that actually exist in the response
+                    existing_cols = [c for c in target_cols if c in display_df.columns]
+                    final_df = display_df[existing_cols].copy()
                     
                     if 'Distance_ft' in final_df.columns:
                         final_df['Distance_ft'] = final_df['Distance_ft'].astype(int)
@@ -263,4 +280,4 @@ if submit_btn and user_address:
                         st.dataframe(final_df, use_container_width=True, height=500)
 
             else:
-                st.warning("No well data returned from Enverus for this region.")
+                st.warning("No well data returned from Enverus for this region (or API quota exceeded).")
