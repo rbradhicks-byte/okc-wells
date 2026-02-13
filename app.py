@@ -67,42 +67,41 @@ def get_enverus_client():
         return None
 
 @st.cache_data(ttl=3600)
-def fetch_nearby_wells(_client, lat, lon, radius_deg=0.05):
+def fetch_county_wells(_client):
     """
-    Fetch well-origins using a Spatial Bounding Box (btw) query.
-    
-    Args:
-        lat (float): Latitude of search center.
-        lon (float): Longitude of search center.
-        radius_deg (float): Approx 0.05 deg is ~3.5 miles (buffer).
+    STRATEGY: Wide Net.
+    Fetch ALL wells for Oklahoma County. 
+    We avoid spatial API filters to prevent 'Invalid Column' errors.
+    We cache this heavy request for 1 hour.
     """
     if not _client:
         return pd.DataFrame()
 
     try:
-        # Calculate Bounding Box
-        min_lat = lat - radius_deg
-        max_lat = lat + radius_deg
-        min_lon = lon - radius_deg
-        max_lon = lon + radius_deg
-
-        # UPDATED QUERY LOGIC: 
-        # 1. Use 'SurfaceLatitude' and 'SurfaceLongitude' (V2 Standard)
-        # 2. Use 'btw' operator for bounding box
-        # 3. Filter 'DeletedDate'='null' to remove soft-deleted records
+        # Query: Filter ONLY by State and County (and active status)
         query_generator = _client.query(
             "well-origins", 
-            SurfaceLatitude=f"btw({min_lat},{max_lat})",
-            SurfaceLongitude=f"btw({min_lon},{max_lon})",
+            County='OKLAHOMA', 
+            StateProvince='OK', 
             DeletedDate='null'
         )
         
         # Generator to DataFrame
         df = pd.DataFrame(list(query_generator))
         
-        # Ensure we have the coordinate columns
+        # Standardize Coordinate Columns if necessary
+        # V2 usually returns 'Latitude'/'Longitude' or 'SurfaceLatitude'/'SurfaceLongitude'
+        # We ensure they map to 'SurfaceLatitude' and 'SurfaceLongitude' for consistency
+        if 'Latitude' in df.columns and 'SurfaceLatitude' not in df.columns:
+            df.rename(columns={'Latitude': 'SurfaceLatitude', 'Longitude': 'SurfaceLongitude'}, inplace=True)
+
+        # Validate existence of coordinates
         if not df.empty and 'SurfaceLatitude' in df.columns and 'SurfaceLongitude' in df.columns:
+            # Drop rows with no coordinates
             df = df.dropna(subset=['SurfaceLatitude', 'SurfaceLongitude'])
+            # Ensure numeric types
+            df['SurfaceLatitude'] = pd.to_numeric(df['SurfaceLatitude'], errors='coerce')
+            df['SurfaceLongitude'] = pd.to_numeric(df['SurfaceLongitude'], errors='coerce')
             return df
             
         return pd.DataFrame()
@@ -139,7 +138,6 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 
 # Search Form Wrapper (Enter Key Support)
-# Define variables outside to persist state slightly better in flow
 user_address_input = ""
 submit_btn = False
 
@@ -185,115 +183,127 @@ if submit_btn and user_address_input:
         client = get_enverus_client()
         
         if client:
-            with st.spinner("Fetching Spatial Data from Enverus..."):
-                # Pass lat/lon to query function for Bounding Box logic
-                wells_df = fetch_nearby_wells(client, lat, lon)
+            with st.spinner("Fetching Data from Enverus (Wide Net)..."):
+                # Fetch ALL county data
+                full_county_df = fetch_county_wells(client)
 
-            if not wells_df.empty:
-                # UPDATED GEOMETRY: Using 'SurfaceLongitude' and 'SurfaceLatitude'
-                wells_gdf = gpd.GeoDataFrame(
-                    wells_df,
-                    geometry=gpd.points_from_xy(wells_df.SurfaceLongitude, wells_df.SurfaceLatitude),
-                    crs="EPSG:4326"
-                )
+            if not full_county_df.empty:
+                # D. PYTHON-SIDE SPATIAL FILTERING
+                # Filter down to roughly +/- 0.05 degrees (approx 3-4 miles) to optimize mapping
+                search_radius_deg = 0.05
+                min_lat, max_lat = lat - search_radius_deg, lat + search_radius_deg
+                min_lon, max_lon = lon - search_radius_deg, lon + search_radius_deg
 
-                # Spatial calculations in meters (EPSG:32124 Oklahoma North)
-                projected_aoi = aoi_gdf.to_crs("EPSG:32124")
-                projected_wells = wells_gdf.to_crs("EPSG:32124")
-                
-                # Filter wells within 10,000ft (approx 3km) buffer of the property
-                buffer_area = projected_aoi.buffer(10000).geometry.iloc[0]
-                mask = projected_wells.within(buffer_area)
-                nearby_wells = projected_wells[mask].copy()
+                wells_df = full_county_df[
+                    (full_county_df.SurfaceLatitude.between(min_lat, max_lat)) & 
+                    (full_county_df.SurfaceLongitude.between(min_lon, max_lon))
+                ].copy()
 
-                # Calculate Distance to Property Boundary (ft)
-                nearby_wells['Distance_ft'] = nearby_wells.geometry.apply(
-                    lambda x: projected_aoi.distance(x)
-                ).iloc[:, 0] * 3.28084
+                if wells_df.empty:
+                    st.warning("No wells found within immediate vicinity (3-4 miles).")
+                else:
+                    # Create GeoDataFrame
+                    wells_gdf = gpd.GeoDataFrame(
+                        wells_df,
+                        geometry=gpd.points_from_xy(wells_df.SurfaceLongitude, wells_df.SurfaceLatitude),
+                        crs="EPSG:4326"
+                    )
 
-                # Back to WGS84 for display
-                display_wells = nearby_wells.to_crs("EPSG:4326")
-                display_wells = display_wells.sort_values('Distance_ft').head(50)
-
-                # ---------------------------------------------------------
-                # 5. UI OUTPUTS
-                # ---------------------------------------------------------
-                
-                # Metrics
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Search Context", "Oklahoma County, OK")
-                m2.metric("Wells Found (Nearby)", len(display_wells))
-                closest_dist = display_wells['Distance_ft'].min() if not display_wells.empty else 0
-                m3.metric("Closest Well", f"{closest_dist:,.0f} ft")
-
-                col_map, col_data = st.columns([1, 1])
-
-                # --- MAP GENERATION ---
-                with col_map:
-                    st.subheader("Satellite Reconnaissance")
+                    # Spatial calculations in meters (EPSG:32124 Oklahoma North)
+                    projected_aoi = aoi_gdf.to_crs("EPSG:32124")
+                    projected_wells = wells_gdf.to_crs("EPSG:32124")
                     
-                    center_lat = aoi_gdf.geometry.centroid.y.mean()
-                    center_lon = aoi_gdf.geometry.centroid.x.mean()
+                    # Exact Distance Calculation
+                    # Calculate distance from property boundary
+                    projected_wells['Distance_ft'] = projected_wells.geometry.apply(
+                        lambda x: projected_aoi.distance(x)
+                    ) * 3.28084 # Meters to Feet
+
+                    # Back to WGS84 for display
+                    display_wells = projected_wells.to_crs("EPSG:4326")
                     
-                    m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
+                    # Sort by distance and take top 50
+                    display_wells = display_wells.sort_values('Distance_ft').head(50)
 
-                    # Esri Satellite Tiles (No Google)
-                    folium.TileLayer(
-                        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                        attr='Esri',
-                        name='Esri Satellite',
-                        overlay=False,
-                        control=True
-                    ).add_to(m)
+                    # ---------------------------------------------------------
+                    # 5. UI OUTPUTS
+                    # ---------------------------------------------------------
+                    
+                    # Metrics
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Search Context", "Oklahoma County, OK")
+                    m2.metric("Wells Found (Nearby)", len(display_wells))
+                    closest_dist = display_wells['Distance_ft'].min() if not display_wells.empty else 0
+                    m3.metric("Closest Well", f"{closest_dist:,.0f} ft")
 
-                    # Property Boundary (Yellow)
-                    folium.GeoJson(
-                        aoi_gdf,
-                        name="Property Boundary",
-                        style_function=lambda x: {'color': '#FFFF00', 'fillColor': '#FFFF00', 'weight': 3, 'fillOpacity': 0.1}
-                    ).add_to(m)
+                    col_map, col_data = st.columns([1, 1])
 
-                    # Wells (Cyan with Navy Fill)
-                    for _, row in display_wells.iterrows():
-                        # Handle potential missing fields gracefully for popup
-                        wn = row.get('WellName', 'Unknown')
-                        api = row.get('API_UWI_14', 'N/A')
-                        op = row.get('OperatorName', 'N/A')
+                    # --- MAP GENERATION ---
+                    with col_map:
+                        st.subheader("Satellite Reconnaissance")
                         
-                        folium.CircleMarker(
-                            location=[row.geometry.y, row.geometry.x],
-                            radius=5,
-                            color='#00FFFF',
-                            fill=True,
-                            fill_color=NAVY_BLUE, 
-                            popup=folium.Popup(f"<b>{wn}</b><br>API: {api}<br>Op: {op}", max_width=250)
+                        center_lat = aoi_gdf.geometry.centroid.y.mean()
+                        center_lon = aoi_gdf.geometry.centroid.x.mean()
+                        
+                        m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
+
+                        # Esri Satellite Tiles (No Google)
+                        folium.TileLayer(
+                            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                            attr='Esri',
+                            name='Esri Satellite',
+                            overlay=False,
+                            control=True
                         ).add_to(m)
 
-                    st_folium(m, width="100%", height=500)
+                        # Property Boundary (Yellow)
+                        folium.GeoJson(
+                            aoi_gdf,
+                            name="Property Boundary",
+                            style_function=lambda x: {'color': '#FFFF00', 'fillColor': '#FFFF00', 'weight': 3, 'fillOpacity': 0.1}
+                        ).add_to(m)
 
-                # --- DATA TABLE ---
-                with col_data:
-                    st.subheader("Well Inventory")
-                    
-                    # REQUIRED COLUMN NAMES
-                    target_cols = ['WellName', 'OperatorName', 'API_UWI_14', 'TotalDepth', 'Distance_ft']
-                    
-                    display_df = pd.DataFrame(display_wells)
-                    # Filter for columns that actually exist in the response
-                    existing_cols = [c for c in target_cols if c in display_df.columns]
-                    final_df = display_df[existing_cols].copy()
-                    
-                    if 'Distance_ft' in final_df.columns:
-                        final_df['Distance_ft'] = final_df['Distance_ft'].astype(int)
-                    
-                    try:
-                        st.dataframe(
-                            final_df.style.background_gradient(cmap="Blues", subset=['Distance_ft']),
-                            use_container_width=True,
-                            height=500
-                        )
-                    except Exception:
-                        st.dataframe(final_df, use_container_width=True, height=500)
+                        # Wells (Cyan with Navy Fill)
+                        for _, row in display_wells.iterrows():
+                            # Handle potential missing fields gracefully for popup
+                            wn = row.get('WellName', 'Unknown')
+                            api = row.get('API_UWI_14', 'N/A')
+                            op = row.get('OperatorName', 'N/A')
+                            
+                            folium.CircleMarker(
+                                location=[row.geometry.y, row.geometry.x],
+                                radius=5,
+                                color='#00FFFF',
+                                fill=True,
+                                fill_color=NAVY_BLUE, 
+                                popup=folium.Popup(f"<b>{wn}</b><br>API: {api}<br>Op: {op}", max_width=250)
+                            ).add_to(m)
+
+                        st_folium(m, width="100%", height=500)
+
+                    # --- DATA TABLE ---
+                    with col_data:
+                        st.subheader("Well Inventory")
+                        
+                        # REQUIRED COLUMN NAMES
+                        target_cols = ['WellName', 'OperatorName', 'API_UWI_14', 'TotalDepth', 'Distance_ft']
+                        
+                        display_df = pd.DataFrame(display_wells)
+                        # Filter for columns that actually exist in the response
+                        existing_cols = [c for c in target_cols if c in display_df.columns]
+                        final_df = display_df[existing_cols].copy()
+                        
+                        if 'Distance_ft' in final_df.columns:
+                            final_df['Distance_ft'] = final_df['Distance_ft'].astype(int)
+                        
+                        try:
+                            st.dataframe(
+                                final_df.style.background_gradient(cmap="Blues", subset=['Distance_ft']),
+                                use_container_width=True,
+                                height=500
+                            )
+                        except Exception:
+                            st.dataframe(final_df, use_container_width=True, height=500)
 
             else:
-                st.warning("No well data found in this specific area.")
+                st.warning("No well data returned from Enverus for Oklahoma County.")
