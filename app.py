@@ -47,9 +47,7 @@ def fetch_enverus_data():
             api_key=creds.get("api_key", "NA")
         )
         
-        # Reduced to only two parameters. 
-        # Note: County is PascalCase, StateProvince is PascalCase.
-        # We removed DeletedDate to eliminate any potential column name conflict.
+        # Using PascalCase for keyword arguments as per V2 documentation
         query_generator = d2.query(
             'well-origins',
             County='OKLAHOMA',
@@ -77,7 +75,7 @@ if submit_button and raw_address:
         if location:
             target_lat, target_lon = location.latitude, location.longitude
             
-            # Boundary Logic
+            # Boundary Logic (User file or 10-acre square fallback)
             if uploaded_file:
                 gdf_boundary = gpd.read_file(uploaded_file)
                 property_poly = gdf_boundary.geometry.iloc[0]
@@ -93,7 +91,7 @@ if submit_button and raw_address:
             df_all = fetch_enverus_data()
 
             if not df_all.empty:
-                # Coordinate Identification
+                # Coordinate Identification logic
                 lat_col = next((c for c in df_all.columns if c.lower() in ['surfacelatitude', 'latitude']), None)
                 lon_col = next((c for c in df_all.columns if c.lower() in ['surfacelongitude', 'longitude']), None)
                 
@@ -111,6 +109,7 @@ if submit_button and raw_address:
                     def calc_dist(row):
                         p = Point(row[lon_col], row[lat_col])
                         if property_poly.contains(p): return 0
+                        # Approx conversion degrees to feet
                         return round(property_poly.distance(p) * 364000, 0)
 
                     if not df_nearby.empty:
@@ -120,4 +119,35 @@ if submit_button and raw_address:
                         m1.metric("Wells ON Property", len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0]))
                         m2.metric("Wells Nearby (1mi)", len(df_nearby[df_nearby['Dist_to_Prop_ft'] > 0]))
 
-                        m = folium.Map(location
+                        # MAP INITIALIZATION
+                        m = folium.Map(location=[target_lat, target_lon], zoom_start=15)
+                        folium.TileLayer(
+                            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                            attr='Esri', name='Satellite'
+                        ).add_to(m)
+                        
+                        folium.GeoJson(property_poly, name="Property", style_function=lambda x: {'color':'blue', 'fillOpacity':0.1}).add_to(m)
+                        
+                        name_col = next((c for c in df_nearby.columns if 'name' in c.lower()), None)
+                        
+                        for _, row in df_nearby.iterrows():
+                            color = 'green' if row['Dist_to_Prop_ft'] == 0 else 'orange'
+                            popup_text = f"Well: {row[name_col]}" if name_col else "Well"
+                            folium.CircleMarker(
+                                location=[row[lat_col], row[lon_col]],
+                                radius=6, color=color, fill=True,
+                                popup=popup_text
+                            ).add_to(m)
+                        
+                        folium_static(m)
+                        
+                        st.subheader("Nearby Well Details")
+                        st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
+                    else:
+                        st.warning("Address found, but no wells are within 1.5 miles in the Enverus results.")
+                else:
+                    st.error(f"Coordinates missing. Available columns: {list(df_all.columns)}")
+            else:
+                st.error("Enverus returned 0 records. Ensure your API account has access to the 'well-origins' dataset for Oklahoma.")
+        else:
+            st.error("Address not found.")
