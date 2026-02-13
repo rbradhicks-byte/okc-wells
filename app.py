@@ -40,7 +40,6 @@ uploaded_file = st.sidebar.file_uploader("Upload Property Boundary (.geojson)", 
 
 # 4. DATA LOGIC
 def get_dummy_data(lat, lon):
-    """Returns a few fake wells near the search point for UI testing."""
     data = [
         {"WellName": "Test Well 1H", "OperatorName": "Oklahoma Energy Dev", "SurfaceLatitude": lat + 0.005, "SurfaceLongitude": lon + 0.005, "TotalDepth": 12500},
         {"WellName": "Sample 2-24R", "OperatorName": "Pioneer Natural", "SurfaceLatitude": lat - 0.008, "SurfaceLongitude": lon + 0.002, "TotalDepth": 11800},
@@ -49,16 +48,33 @@ def get_dummy_data(lat, lon):
     return pd.DataFrame(data)
 
 def fetch_live_enverus():
-    """Attempts to fetch real data from Enverus."""
     try:
         creds = st.secrets["enverus"]
         d2 = DirectAccessV2(client_id=creds["client_id"], client_secret=creds["client_secret"], api_key=creds.get("api_key", "NA"))
-        # Using the most basic query possible
-        query = d2.query('well-origins', County='OKLAHOMA', pagesize=1000)
+        
+        # Attempt 1: Standard V2 Query
+        # We use the most common case-sensitive keywords for Oklahoma
+        query = d2.query('well-origins', County='OKLAHOMA', StateProvince='OK', pagesize=1000)
         df = pd.DataFrame(list(query))
+        
+        # Attempt 2: Fallback to title-case if All-Caps fails
+        if df.empty:
+            query = d2.query('well-origins', County='Oklahoma', StateProvince='OK', pagesize=1000)
+            df = pd.DataFrame(list(query))
+
+        # Diagnostic: If still empty, pull ANY 1 record to see valid column names
+        if df.empty:
+            st.warning("No wells found for Oklahoma County. Running Diagnostic...")
+            diag = list(d2.query('well-origins', pagesize=1))
+            if diag:
+                st.write("Diagnostic - Valid Columns found in your account:", list(diag[0].keys()))
+                st.write("Diagnostic - Sample Data for first record:", diag[0])
+            else:
+                st.error("Diagnostic failed: Even a broad query returned no data. Check dataset permissions.")
+        
         return df
     except Exception as e:
-        st.sidebar.error(f"API Error: {e}")
+        st.sidebar.error(f"API Connection Error: {e}")
         return pd.DataFrame()
 
 # 5. MAIN LOGIC
@@ -70,19 +86,16 @@ if submit_button and raw_address:
 
         if location:
             t_lat, t_lon = location.latitude, location.longitude
-            
-            # Boundary Fallback (10-acre square)
             offset = 0.001
             property_poly = Polygon([(t_lon-offset, t_lat-offset), (t_lon+offset, t_lat-offset), (t_lon+offset, t_lat+offset), (t_lon-offset, t_lat+offset)])
 
-            # Fetch Data based on toggle
             if data_source == "Live Enverus API":
                 df_all = fetch_live_enverus()
             else:
                 df_all = get_dummy_data(t_lat, t_lon)
 
             if not df_all.empty:
-                # Coordinate Identification
+                # Find Column Names Dynamically
                 lat_col = next((c for c in df_all.columns if c.lower() in ['surfacelatitude', 'latitude']), None)
                 lon_col = next((c for c in df_all.columns if c.lower() in ['surfacelongitude', 'longitude']), None)
                 
@@ -91,16 +104,18 @@ if submit_button and raw_address:
                     df_all[lon_col] = pd.to_numeric(df_all[lon_col], errors='coerce')
                     df_all = df_all.dropna(subset=[lat_col, lon_col])
 
-                    # Distance Math
                     def calc_dist(row):
                         p = Point(row[lon_col], row[lat_col])
                         if property_poly.contains(p): return 0
                         return round(property_poly.distance(p) * 364000, 0)
 
                     df_all['Dist_to_Prop_ft'] = df_all.apply(calc_dist, axis=1)
-                    df_nearby = df_all[df_all['Dist_to_Prop_ft'] < 10000].copy() # 2-mile radius filter
+                    # Filter for 2-mile radius
+                    df_nearby = df_all[
+                        (df_all[lat_col].between(t_lat-0.03, t_lat+0.03)) & 
+                        (df_all[lon_col].between(t_lon-0.03, t_lon+0.03))
+                    ].copy()
 
-                    # Display
                     c1, c2 = st.columns(2)
                     c1.metric("Wells ON Property", len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0]))
                     c2.metric("Nearby Wells", len(df_nearby))
@@ -118,8 +133,8 @@ if submit_button and raw_address:
                     st.subheader("Well Details")
                     st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
                 else:
-                    st.error(f"Data found but no coordinate columns detected. Columns: {list(df_all.columns)}")
+                    st.error(f"Required coordinates missing. Found columns: {list(df_all.columns)}")
             else:
-                st.error("No data returned. If using Live API, check your credentials.")
+                st.error("No data returned. If using Live API, look at the Diagnostic warnings above.")
         else:
             st.error("Address not found.")
