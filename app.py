@@ -37,7 +37,7 @@ with st.form("search_form"):
 st.sidebar.header("Property Settings")
 uploaded_file = st.sidebar.file_uploader("Upload Property Boundary (.geojson)", type=['geojson'])
 
-# 4. DATA FETCHING (Using Raw Query for Maximum Control)
+# 4. DATA FETCHING (Minimum Viable Query)
 def fetch_enverus_data():
     try:
         creds = st.secrets["enverus"]
@@ -47,16 +47,16 @@ def fetch_enverus_data():
             api_key=creds.get("api_key", "NA")
         )
         
-        # Use lowercase filter names for V2 stability
-        # We fetch only the bare essentials to avoid 'incorrect field' errors
+        # Reduced to only two parameters. 
+        # Note: County is PascalCase, StateProvince is PascalCase.
+        # We removed DeletedDate to eliminate any potential column name conflict.
         query_generator = d2.query(
             'well-origins',
-            county='OKLAHOMA',
-            deleted_date='null',
+            County='OKLAHOMA',
+            StateProvince='OK',
             pagesize=10000
         )
         
-        # Convert generator to DataFrame
         results = list(query_generator)
         if not results:
             return pd.DataFrame()
@@ -70,7 +70,6 @@ def fetch_enverus_data():
 # 5. MAIN LOGIC
 if submit_button and raw_address:
     with st.spinner("Analyzing location and fetching data..."):
-        # Geocode the address
         full_address = f"{raw_address}, Oklahoma County, OK"
         geolocator = ArcGIS(user_agent="okc_well_portal")
         location = geolocator.geocode(full_address)
@@ -83,7 +82,6 @@ if submit_button and raw_address:
                 gdf_boundary = gpd.read_file(uploaded_file)
                 property_poly = gdf_boundary.geometry.iloc[0]
             else:
-                # Fallback: 10-acre square (~360ft)
                 offset = 0.001
                 property_poly = Polygon([
                     (target_lon-offset, target_lat-offset),
@@ -95,7 +93,7 @@ if submit_button and raw_address:
             df_all = fetch_enverus_data()
 
             if not df_all.empty:
-                # Find the coordinate columns regardless of casing
+                # Coordinate Identification
                 lat_col = next((c for c in df_all.columns if c.lower() in ['surfacelatitude', 'latitude']), None)
                 lon_col = next((c for c in df_all.columns if c.lower() in ['surfacelongitude', 'longitude']), None)
                 
@@ -122,37 +120,4 @@ if submit_button and raw_address:
                         m1.metric("Wells ON Property", len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0]))
                         m2.metric("Wells Nearby (1mi)", len(df_nearby[df_nearby['Dist_to_Prop_ft'] > 0]))
 
-                        # Map
-                        m = folium.Map(location=[target_lat, target_lon], zoom_start=15)
-                        folium.TileLayer(
-                            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                            attr='Esri', name='Satellite'
-                        ).add_to(m)
-                        
-                        folium.GeoJson(property_poly, name="Property", style_function=lambda x: {'color':'blue', 'fillOpacity':0.1}).add_to(m)
-                        
-                        # Use first available 'Name' column
-                        name_col = next((c for c in df_nearby.columns if 'name' in c.lower()), None)
-                        
-                        for _, row in df_nearby.iterrows():
-                            color = 'green' if row['Dist_to_Prop_ft'] == 0 else 'orange'
-                            popup_text = f"Well: {row[name_col]}" if name_col else "Well"
-                            folium.CircleMarker(
-                                location=[row[lat_col], row[lon_col]],
-                                radius=6, color=color, fill=True,
-                                popup=popup_text
-                            ).add_to(m)
-                        
-                        folium_static(m)
-                        
-                        st.subheader("Nearby Well Details")
-                        # Display all columns to see what the API actually returned
-                        st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
-                    else:
-                        st.warning("Address found, but no wells are within 1.5 miles in the Enverus results.")
-                else:
-                    st.error(f"Retrieve successful, but no coordinate columns found. Columns returned: {list(df_all.columns)}")
-            else:
-                st.error("Enverus returned 0 records for Oklahoma County. Please verify credentials or dataset permissions.")
-        else:
-            st.error("Address not found. Please check spelling or add a zip code.")
+                        m = folium.Map(location
