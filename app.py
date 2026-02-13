@@ -50,20 +50,14 @@ def get_dummy_data(lat, lon):
 def fetch_live_enverus():
     try:
         creds = st.secrets["enverus"]
-        d2 = DirectAccessV2(client_id=creds["client_id"], client_secret=creds["client_secret"], api_key=creds.get("api_key", "NA"))
-        
-        # WE REMOVE ALL KEYWORD FILTERS (Like County/State) TO PREVENT API ERRORS.
-        # We fetch the first 10,000 records from the dataset globally.
-        query = d2.query('well-origins', pagesize=10000)
+        d2 = DirectAccessV2(
+            client_id=creds["client_id"], 
+            client_secret=creds["client_secret"], 
+            api_key=creds.get("api_key", "NA")
+        )
+        # Pulling a small sample without filters to ensure no 'invalid column' errors
+        query = d2.query('well-origins', pagesize=1000)
         df = pd.DataFrame(list(query))
-
-        if not df.empty:
-            # We filter for Oklahoma in Python memory to bypass the API's 'stateprovince' error.
-            # We look for ANY column that might contain county or state info.
-            county_col = next((c for c in df.columns if 'county' in c.lower()), None)
-            if county_col:
-                df = df[df[county_col].astype(str).str.upper().str.contains('OKLAHOMA', na=False)]
-        
         return df
     except Exception as e:
         st.sidebar.error(f"API Connection Error: {e}")
@@ -78,6 +72,8 @@ if submit_button and raw_address:
 
         if location:
             t_lat, t_lon = location.latitude, location.longitude
+            
+            # Fallback square boundary
             offset = 0.001
             property_poly = Polygon([(t_lon-offset, t_lat-offset), (t_lon+offset, t_lat-offset), (t_lon+offset, t_lat+offset), (t_lon-offset, t_lat+offset)])
 
@@ -102,17 +98,18 @@ if submit_button and raw_address:
                         return round(property_poly.distance(p) * 364000, 0)
 
                     df_all['Dist_to_Prop_ft'] = df_all.apply(calc_dist, axis=1)
-                    # Filter for 2-mile radius
+                    # Filter for wells within approx 3 miles for speed
                     df_nearby = df_all[
-                        (df_all[lat_col].between(t_lat-0.03, t_lat+0.03)) & 
-                        (df_all[lon_col].between(t_lon-0.03, t_lon+0.03))
+                        (df_all[lat_col].between(t_lat-0.05, t_lat+0.05)) & 
+                        (df_all[lon_col].between(t_lon-0.05, t_lon+0.05))
                     ].copy()
 
+                    # DISPLAY RESULTS
                     c1, c2 = st.columns(2)
                     c1.metric("Wells ON Property", len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0]))
-                    c2.metric("Nearby Wells", len(df_nearby))
+                    c2.metric("Nearby Wells (Filtered)", len(df_nearby))
 
-                    m = folium.Map(location=[t_lat, t_lon], zoom_start=15)
+                    m = folium.Map(location=[t_lat, t_lon], zoom_start=14)
                     folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Satellite').add_to(m)
                     folium.GeoJson(property_poly, name="Property", style_function=lambda x: {'color':'blue', 'fillOpacity':0.1}).add_to(m)
                     
@@ -125,8 +122,8 @@ if submit_button and raw_address:
                     st.subheader("Well Details")
                     st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
                 else:
-                    st.error(f"No coordinate columns found. Columns: {list(df_all.columns)}")
+                    st.error("No coordinate columns found in data.")
             else:
-                st.error("No data returned from Enverus. Verify your credentials and that your account has 'Read' access to the well-origins dataset.")
+                st.error("No data returned from source.")
         else:
             st.error("Address not found.")
