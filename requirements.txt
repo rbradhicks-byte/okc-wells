@@ -1,7 +1,8 @@
 streamlit
+enverus-developer-api
+shapely
+geopy
+pandas
 folium
 streamlit-folium
-geopy
-shapely
-pandas
-enverus-developer-api
+matplotlib
