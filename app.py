@@ -65,37 +65,45 @@ def get_enverus_client():
         return None
 
 @st.cache_data(ttl=3600)
-def fetch_ok_wells(_client):
+def fetch_nearby_wells(_client, lat, lon, radius_deg=0.05):
     """
-    Fetch well-origins for Oklahoma County, OK.
-    Uses specific query parameters supported by Direct Access V2.
+    Fetch well-origins using a Spatial Bounding Box (btw) query.
+    
+    Args:
+        lat (float): Latitude of search center.
+        lon (float): Longitude of search center.
+        radius_deg (float): Approx 0.05 deg is ~3.5 miles (buffer).
     """
     if not _client:
         return pd.DataFrame()
 
     try:
-        # UPDATED QUERY LOGIC:
-        # Removed 'filters' dict and 'headers'. 
-        # Passed params directly as kwargs: county, state_province, deleteddate.
+        # Calculate Bounding Box
+        min_lat = lat - radius_deg
+        max_lat = lat + radius_deg
+        min_lon = lon - radius_deg
+        max_lon = lon + radius_deg
+
+        # UPDATED QUERY LOGIC: Spatial Bounding Box
+        # We use 'Latitude' and 'Longitude' with the 'btw()' operator.
+        # We use 'DeletedDate' (PascalCase) = 'null' to exclude deleted records.
         query_generator = _client.query(
             "well-origins", 
-            county='OKLAHOMA', 
-            state_province='OK', 
-            deleteddate='null'
+            Latitude=f"btw({min_lat},{max_lat})",
+            Longitude=f"btw({min_lon},{max_lon})",
+            DeletedDate='null'
         )
         
         # Generator to DataFrame
         df = pd.DataFrame(list(query_generator))
         
-        # UPDATED FIELD MAPPING:
-        # Ensure we have the coordinate columns (Latitude/Longitude)
+        # Ensure we have the coordinate columns
         if not df.empty and 'Latitude' in df.columns and 'Longitude' in df.columns:
             df = df.dropna(subset=['Latitude', 'Longitude'])
             return df
             
         return pd.DataFrame()
     except Exception as e:
-        # Catch specific API errors
         st.error(f"Enverus API Error: {e}")
         return pd.DataFrame()
 
@@ -128,6 +136,10 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 
 # Search Form Wrapper (Enter Key Support)
+# We define the variables outside the form context to access them later
+user_address = ""
+submit_btn = False
+
 with st.form("search_form"):
     search_col1, search_col2 = st.columns([3, 1])
     with search_col1:
@@ -170,114 +182,16 @@ if submit_btn and user_address:
         client = get_enverus_client()
         
         if client:
-            with st.spinner("Fetching Data from Enverus..."):
-                wells_df = fetch_ok_wells(client)
+            with st.spinner("Fetching Spatial Data from Enverus..."):
+                # Pass lat/lon to query function for Bounding Box logic
+                wells_df = fetch_nearby_wells(client, lat, lon)
 
             if not wells_df.empty:
-                # UPDATED GEOMETRY: Using 'Longitude' and 'Latitude' columns
+                # UPDATED GEOMETRY: Using 'Longitude' and 'Latitude' columns from result
                 wells_gdf = gpd.GeoDataFrame(
                     wells_df,
                     geometry=gpd.points_from_xy(wells_df.Longitude, wells_df.Latitude),
                     crs="EPSG:4326"
                 )
 
-                # Spatial calculations in meters (EPSG:32124 Oklahoma North)
-                projected_aoi = aoi_gdf.to_crs("EPSG:32124")
-                projected_wells = wells_gdf.to_crs("EPSG:32124")
-                
-                # Filter wells within 10,000ft (approx 3km) buffer
-                buffer_area = projected_aoi.buffer(10000).geometry.iloc[0]
-                mask = projected_wells.within(buffer_area)
-                nearby_wells = projected_wells[mask].copy()
-
-                # Calculate Distance to Property Boundary (ft)
-                nearby_wells['Distance_ft'] = nearby_wells.geometry.apply(
-                    lambda x: projected_aoi.distance(x)
-                ).iloc[:, 0] * 3.28084
-
-                # Back to WGS84 for display
-                display_wells = nearby_wells.to_crs("EPSG:4326")
-                display_wells = display_wells.sort_values('Distance_ft').head(50)
-
-                # ---------------------------------------------------------
-                # 5. UI OUTPUTS
-                # ---------------------------------------------------------
-                
-                # Metrics
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Search Context", "Oklahoma County, OK")
-                m2.metric("Wells Found (Nearby)", len(display_wells))
-                closest_dist = display_wells['Distance_ft'].min() if not display_wells.empty else 0
-                m3.metric("Closest Well", f"{closest_dist:,.0f} ft")
-
-                col_map, col_data = st.columns([1, 1])
-
-                # --- MAP GENERATION ---
-                with col_map:
-                    st.subheader("Satellite Reconnaissance")
-                    
-                    center_lat = aoi_gdf.geometry.centroid.y.mean()
-                    center_lon = aoi_gdf.geometry.centroid.x.mean()
-                    
-                    m = folium.Map(location=[center_lat, center_lon], zoom_start=15)
-
-                    # Esri Satellite Tiles
-                    folium.TileLayer(
-                        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                        attr='Esri',
-                        name='Esri Satellite',
-                        overlay=False,
-                        control=True
-                    ).add_to(m)
-
-                    # Property Boundary (Yellow)
-                    folium.GeoJson(
-                        aoi_gdf,
-                        name="Property Boundary",
-                        style_function=lambda x: {'color': '#FFFF00', 'fillColor': '#FFFF00', 'weight': 3, 'fillOpacity': 0.1}
-                    ).add_to(m)
-
-                    # Wells (Cyan with Navy Fill)
-                    for _, row in display_wells.iterrows():
-                        # Handle potential missing fields gracefully for popup
-                        wn = row.get('WellName', 'Unknown')
-                        api = row.get('API_UWI_14', 'N/A')
-                        op = row.get('OperatorName', 'N/A')
-                        
-                        folium.CircleMarker(
-                            location=[row.geometry.y, row.geometry.x],
-                            radius=5,
-                            color='#00FFFF',
-                            fill=True,
-                            fill_color=NAVY_BLUE, 
-                            popup=folium.Popup(f"<b>{wn}</b><br>API: {api}<br>Op: {op}", max_width=250)
-                        ).add_to(m)
-
-                    st_folium(m, width="100%", height=500)
-
-                # --- DATA TABLE ---
-                with col_data:
-                    st.subheader("Well Inventory")
-                    
-                    # UPDATED COLUMN NAMES
-                    target_cols = ['WellName', 'OperatorName', 'API_UWI_14', 'TotalDepth', 'Distance_ft']
-                    
-                    display_df = pd.DataFrame(display_wells)
-                    # Filter for columns that actually exist in the response
-                    existing_cols = [c for c in target_cols if c in display_df.columns]
-                    final_df = display_df[existing_cols].copy()
-                    
-                    if 'Distance_ft' in final_df.columns:
-                        final_df['Distance_ft'] = final_df['Distance_ft'].astype(int)
-                    
-                    try:
-                        st.dataframe(
-                            final_df.style.background_gradient(cmap="Blues", subset=['Distance_ft']),
-                            use_container_width=True,
-                            height=500
-                        )
-                    except Exception:
-                        st.dataframe(final_df, use_container_width=True, height=500)
-
-            else:
-                st.warning("No well data returned from Enverus for this region (or API quota exceeded).")
+                # Spatial calculations in meters (EP
