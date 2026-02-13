@@ -37,8 +37,8 @@ with st.form("search_form"):
 st.sidebar.header("Property Settings")
 uploaded_file = st.sidebar.file_uploader("Upload Property Boundary (.geojson)", type=['geojson'])
 
-# 4. DATA FETCHING (Interrogative Logic)
-def fetch_enverus_data():
+# 4. DATA FETCHING (Spatial Bounding Box)
+def fetch_nearby_wells(lat, lon):
     try:
         creds = st.secrets["enverus"]
         d2 = DirectAccessV2(
@@ -47,30 +47,26 @@ def fetch_enverus_data():
             api_key=creds.get("api_key", "NA")
         )
         
-        # Variation 1: All Caps (Standard)
-        results = list(d2.query('well-origins', county='OKLAHOMA', pagesize=10000))
+        # Define a ~2-mile box (+/- 0.03 degrees)
+        # We use the 'btw' (between) function which is native to Enverus V2
+        query_generator = d2.query(
+            'well-origins',
+            SurfaceLatitude=f'btw({lat-0.03}, {lat+0.03})',
+            SurfaceLongitude=f'btw({lon-0.03}, {lon+0.03})',
+            DeletedDate='null',
+            pagesize=1000
+        )
         
-        # Variation 2: Title Case
-        if not results:
-            results = list(d2.query('well-origins', county='Oklahoma', pagesize=10000))
-            
-        # Variation 3: No county filter (Permission Check)
-        if not results:
-            st.warning("No wells found for Oklahoma County. Testing API permissions...")
-            results = list(d2.query('well-origins', pagesize=5))
-            if results:
-                st.info(f"API is working, but Oklahoma County returned nothing. Available counties in your data include: {results[0].get('County')}")
-                return pd.DataFrame()
-
+        results = list(query_generator)
         return pd.DataFrame(results)
     
     except Exception as e:
-        st.error(f"Enverus API Error: {e}")
+        st.error(f"Enverus Spatial Query Error: {e}")
         return pd.DataFrame()
 
 # 5. MAIN LOGIC
 if submit_button and raw_address:
-    with st.spinner("Analyzing location and querying Enverus..."):
+    with st.spinner("Geocoding address and querying Enverus spatially..."):
         full_address = f"{raw_address}, Oklahoma County, OK"
         geolocator = ArcGIS(user_agent="okc_well_portal")
         location = geolocator.geocode(full_address)
@@ -78,74 +74,61 @@ if submit_button and raw_address:
         if location:
             target_lat, target_lon = location.latitude, location.longitude
             
-            # Boundary Fallback
-            if uploaded_file:
-                gdf_boundary = gpd.read_file(uploaded_file)
-                property_poly = gdf_boundary.geometry.iloc[0]
-            else:
-                offset = 0.001
-                property_poly = Polygon([
-                    (target_lon-offset, target_lat-offset),
-                    (target_lon+offset, target_lat-offset),
-                    (target_lon+offset, target_lat+offset),
-                    (target_lon-offset, target_lat+offset)
-                ])
+            # Create a fallback 10-acre property polygon
+            offset = 0.001
+            property_poly = Polygon([
+                (target_lon-offset, target_lat-offset),
+                (target_lon+offset, target_lat-offset),
+                (target_lon+offset, target_lat+offset),
+                (target_lon-offset, target_lat+offset)
+            ])
 
-            df_all = fetch_enverus_data()
+            # Fetch Data using coordinates
+            df_nearby = fetch_nearby_wells(target_lat, target_lon)
 
-            if not df_all.empty:
-                # Coordinate Identification
-                lat_col = next((c for c in df_all.columns if c.lower() in ['surfacelatitude', 'latitude']), None)
-                lon_col = next((c for c in df_all.columns if c.lower() in ['surfacelongitude', 'longitude']), None)
+            if not df_nearby.empty:
+                # Find column names (API returns PascalCase usually)
+                lat_col = next((c for c in df_nearby.columns if 'lat' in c.lower()), None)
+                lon_col = next((c for c in df_nearby.columns if 'lon' in c.lower()), None)
                 
                 if lat_col and lon_col:
-                    df_all[lat_col] = pd.to_numeric(df_all[lat_col], errors='coerce')
-                    df_all[lon_col] = pd.to_numeric(df_all[lon_col], errors='coerce')
-                    df_all = df_all.dropna(subset=[lat_col, lon_col])
+                    df_nearby[lat_col] = pd.to_numeric(df_nearby[lat_col], errors='coerce')
+                    df_nearby[lon_col] = pd.to_numeric(df_nearby[lon_col], errors='coerce')
+                    df_nearby = df_nearby.dropna(subset=[lat_col, lon_col])
 
-                    # Local Filter (1.5 miles)
-                    df_nearby = df_all[
-                        (df_all[lat_col].between(target_lat-0.02, target_lat+0.02)) & 
-                        (df_all[lon_col].between(target_lon-0.02, target_lon+0.02))
-                    ].copy()
+                    def calc_dist(row):
+                        p = Point(row[lon_col], row[lat_col])
+                        if property_poly.contains(p): return 0
+                        return round(property_poly.distance(p) * 364000, 0)
 
-                    if not df_nearby.empty:
-                        def calc_dist(row):
-                            p = Point(row[lon_col], row[lat_col])
-                            if property_poly.contains(p): return 0
-                            return round(property_poly.distance(p) * 364000, 0)
+                    df_nearby['Dist_to_Prop_ft'] = df_nearby.apply(calc_dist, axis=1)
+                    
+                    # Metrics
+                    m1, m2 = st.columns(2)
+                    m1.metric("Wells ON Property", len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0]))
+                    m2.metric("Nearby Wells (2mi)", len(df_nearby))
 
-                        df_nearby['Dist_to_Prop_ft'] = df_nearby.apply(calc_dist, axis=1)
-                        
-                        m1, m2 = st.columns(2)
-                        m1.metric("Wells ON Property", len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0]))
-                        m2.metric("Nearby Wells", len(df_nearby[df_nearby['Dist_to_Prop_ft'] > 0]))
-
-                        m = folium.Map(location=[target_lat, target_lon], zoom_start=15)
-                        folium.TileLayer(
-                            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                            attr='Esri', name='Satellite'
+                    # Map
+                    m = folium.Map(location=[target_lat, target_lon], zoom_start=14)
+                    folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', attr='Esri', name='Satellite').add_to(m)
+                    
+                    folium.GeoJson(property_poly, name="Property", style_function=lambda x: {'color':'blue', 'fillOpacity':0.1}).add_to(m)
+                    
+                    name_col = next((c for c in df_nearby.columns if 'name' in c.lower()), 'WellName')
+                    for _, row in df_nearby.iterrows():
+                        color = 'green' if row['Dist_to_Prop_ft'] == 0 else 'orange'
+                        folium.CircleMarker(
+                            location=[row[lat_col], row[lon_col]],
+                            radius=6, color=color, fill=True,
+                            popup=f"Well: {row.get(name_col, 'N/A')}"
                         ).add_to(m)
-                        
-                        folium.GeoJson(property_poly, name="Property", style_function=lambda x: {'color':'blue', 'fillOpacity':0.1}).add_to(m)
-                        
-                        name_col = next((c for c in df_nearby.columns if 'name' in c.lower()), None)
-                        for _, row in df_nearby.iterrows():
-                            color = 'green' if row['Dist_to_Prop_ft'] == 0 else 'orange'
-                            folium.CircleMarker(
-                                location=[row[lat_col], row[lon_col]],
-                                radius=6, color=color, fill=True,
-                                popup=f"Well: {row.get(name_col, 'N/A')}"
-                            ).add_to(m)
-                        
-                        folium_static(m)
-                        st.subheader("Nearby Well Details")
-                        st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
-                    else:
-                        st.warning("No wells found within a 1.5-mile radius.")
+                    
+                    folium_static(m)
+                    st.subheader("Nearby Well Details")
+                    st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
                 else:
-                    st.error(f"Coordinates missing. Columns found: {list(df_all.columns)}")
+                    st.error("No coordinate columns found in the API response.")
             else:
-                st.error("The API request was successful but returned 0 records. This usually means the 'well-origins' dataset is not populated for Oklahoma County in your account subscription.")
+                st.warning(f"No wells found within 2 miles of {target_lat}, {target_lon}. This may indicate a dataset permission issue or a lack of wells in this specific area.")
         else:
             st.error("Address not found.")
