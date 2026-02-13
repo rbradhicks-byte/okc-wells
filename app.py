@@ -12,7 +12,7 @@ from enverus_developer_api import DirectAccessV2
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="OK County Well Discovery", layout="wide")
 
-# CSS Injection: Navy Blue Headers and Metrics (#000080)
+# CSS Injection: Navy Blue Headers (#000080)
 NAVY_BLUE = "#000080"
 st.markdown(
     f"""
@@ -67,36 +67,44 @@ def get_enverus_client():
         return None
 
 @st.cache_data(ttl=3600)
-def fetch_county_wells(_client):
+def fetch_oklahoma_county_wells(_client):
     """
-    STRATEGY: Wide Net.
-    Fetch ALL wells for Oklahoma County. 
-    We avoid spatial API filters to prevent 'Invalid Column' errors.
-    We cache this heavy request for 1 hour.
+    STRATEGY: Wide Net + Python Filter.
+    1. Fetch ALL wells for 'OKLAHOMA' county (ignoring state param to avoid API errors).
+    2. Filter for State='OK' in Python.
+    3. Cache result for 1 hour.
     """
     if not _client:
         return pd.DataFrame()
 
     try:
-        # Query: Filter ONLY by State and County (and active status)
+        # SIMPLIFIED QUERY: Only County and DeletedDate
+        # This avoids 'Invalid Column Name' errors often caused by 'StateProvince' vs 'State' mismatch
         query_generator = _client.query(
             "well-origins", 
             County='OKLAHOMA', 
-            StateProvince='OK', 
             DeletedDate='null'
         )
         
         # Generator to DataFrame
         df = pd.DataFrame(list(query_generator))
         
-        # Standardize Coordinate Columns if necessary
-        # V2 usually returns 'Latitude'/'Longitude' or 'SurfaceLatitude'/'SurfaceLongitude'
-        # We ensure they map to 'SurfaceLatitude' and 'SurfaceLongitude' for consistency
+        if df.empty:
+            return df
+
+        # 1. Standardize Coordinates (Handle V2 variations)
         if 'Latitude' in df.columns and 'SurfaceLatitude' not in df.columns:
             df.rename(columns={'Latitude': 'SurfaceLatitude', 'Longitude': 'SurfaceLongitude'}, inplace=True)
 
-        # Validate existence of coordinates
-        if not df.empty and 'SurfaceLatitude' in df.columns and 'SurfaceLongitude' in df.columns:
+        # 2. Python-Side State Filter (Safety Check)
+        # Check for 'StateProvince' or 'State' column and filter for 'OK'
+        if 'StateProvince' in df.columns:
+            df = df[df['StateProvince'] == 'OK']
+        elif 'State' in df.columns:
+            df = df[df['State'] == 'OK']
+
+        # 3. Validate existence of coordinates
+        if 'SurfaceLatitude' in df.columns and 'SurfaceLongitude' in df.columns:
             # Drop rows with no coordinates
             df = df.dropna(subset=['SurfaceLatitude', 'SurfaceLongitude'])
             # Ensure numeric types
@@ -185,11 +193,11 @@ if submit_btn and user_address_input:
         if client:
             with st.spinner("Fetching Data from Enverus (Wide Net)..."):
                 # Fetch ALL county data
-                full_county_df = fetch_county_wells(client)
+                full_county_df = fetch_oklahoma_county_wells(client)
 
             if not full_county_df.empty:
                 # D. PYTHON-SIDE SPATIAL FILTERING
-                # Filter down to roughly +/- 0.05 degrees (approx 3-4 miles) to optimize mapping
+                # Filter down to roughly +/- 0.05 degrees (approx 3 miles) to optimize mapping performance
                 search_radius_deg = 0.05
                 min_lat, max_lat = lat - search_radius_deg, lat + search_radius_deg
                 min_lon, max_lon = lon - search_radius_deg, lon + search_radius_deg
@@ -200,7 +208,7 @@ if submit_btn and user_address_input:
                 ].copy()
 
                 if wells_df.empty:
-                    st.warning("No wells found within immediate vicinity (3-4 miles).")
+                    st.warning("No wells found within immediate vicinity (3 miles).")
                 else:
                     # Create GeoDataFrame
                     wells_gdf = gpd.GeoDataFrame(
@@ -213,17 +221,21 @@ if submit_btn and user_address_input:
                     projected_aoi = aoi_gdf.to_crs("EPSG:32124")
                     projected_wells = wells_gdf.to_crs("EPSG:32124")
                     
-                    # Exact Distance Calculation
                     # Calculate distance from property boundary
+                    # returns 0 if inside the property, distance in meters otherwise
                     projected_wells['Distance_ft'] = projected_wells.geometry.apply(
                         lambda x: projected_aoi.distance(x)
-                    ) * 3.28084 # Meters to Feet
+                    ) * 3.28084 # Convert Meters to Feet
 
                     # Back to WGS84 for display
                     display_wells = projected_wells.to_crs("EPSG:4326")
                     
-                    # Sort by distance and take top 50
-                    display_wells = display_wells.sort_values('Distance_ft').head(50)
+                    # Categorize: ON Property vs Nearby
+                    on_property = display_wells[display_wells['Distance_ft'] == 0]
+                    nearby = display_wells[display_wells['Distance_ft'] > 0].sort_values('Distance_ft').head(50)
+
+                    # Combine for map display
+                    all_display = pd.concat([on_property, nearby])
 
                     # ---------------------------------------------------------
                     # 5. UI OUTPUTS
@@ -232,9 +244,10 @@ if submit_btn and user_address_input:
                     # Metrics
                     m1, m2, m3 = st.columns(3)
                     m1.metric("Search Context", "Oklahoma County, OK")
-                    m2.metric("Wells Found (Nearby)", len(display_wells))
-                    closest_dist = display_wells['Distance_ft'].min() if not display_wells.empty else 0
-                    m3.metric("Closest Well", f"{closest_dist:,.0f} ft")
+                    m2.metric("Wells ON Property", len(on_property))
+                    
+                    closest_val = nearby['Distance_ft'].min() if not nearby.empty else 0
+                    m3.metric("Closest Offset Well", f"{closest_val:,.0f} ft")
 
                     col_map, col_data = st.columns([1, 1])
 
@@ -264,16 +277,19 @@ if submit_btn and user_address_input:
                         ).add_to(m)
 
                         # Wells (Cyan with Navy Fill)
-                        for _, row in display_wells.iterrows():
+                        for _, row in all_display.iterrows():
                             # Handle potential missing fields gracefully for popup
                             wn = row.get('WellName', 'Unknown')
                             api = row.get('API_UWI_14', 'N/A')
                             op = row.get('OperatorName', 'N/A')
                             
+                            # Distinguish color slightly for On-Property vs Off
+                            color = '#FFFF00' if row['Distance_ft'] == 0 else '#00FFFF' # Yellow if on prop, Cyan if off
+                            
                             folium.CircleMarker(
                                 location=[row.geometry.y, row.geometry.x],
                                 radius=5,
-                                color='#00FFFF',
+                                color=color,
                                 fill=True,
                                 fill_color=NAVY_BLUE, 
                                 popup=folium.Popup(f"<b>{wn}</b><br>API: {api}<br>Op: {op}", max_width=250)
@@ -283,18 +299,19 @@ if submit_btn and user_address_input:
 
                     # --- DATA TABLE ---
                     with col_data:
-                        st.subheader("Well Inventory")
+                        st.subheader("Wells Nearby (1mi)")
                         
                         # REQUIRED COLUMN NAMES
                         target_cols = ['WellName', 'OperatorName', 'API_UWI_14', 'TotalDepth', 'Distance_ft']
                         
-                        display_df = pd.DataFrame(display_wells)
+                        display_df = pd.DataFrame(all_display)
                         # Filter for columns that actually exist in the response
                         existing_cols = [c for c in target_cols if c in display_df.columns]
                         final_df = display_df[existing_cols].copy()
                         
                         if 'Distance_ft' in final_df.columns:
                             final_df['Distance_ft'] = final_df['Distance_ft'].astype(int)
+                            final_df = final_df.sort_values('Distance_ft')
                         
                         try:
                             st.dataframe(
