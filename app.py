@@ -6,7 +6,7 @@ from geopy.geocoders import ArcGIS
 import folium
 from streamlit_folium import st_folium
 from enverus_developer_api import DirectAccessV2
-from enverus_developer_api import developer_api_v3 as enverus_v3
+from enverus_developer_api import DeveloperAPIv3 as enverus_v3
 
 # -----------------------------------------------------------------------------
 # 1. CONFIGURATION & STYLING
