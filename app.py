@@ -7,10 +7,9 @@ from enverus_developer_api import DirectAccessV2
 from shapely.geometry import Point, Polygon
 import geopandas as gpd
 
-# 1. PAGE CONFIG & CSS STYLING
+# 1. PAGE CONFIG & CSS
 st.set_page_config(page_title="OKC Well Discovery", layout="wide")
 
-# CSS to force Navy Blue (#000080) on headers and metrics
 st.markdown("""
     <style>
     h1, h2, h3, h4, [data-testid="stMetricLabel"] p {
@@ -48,29 +47,24 @@ def fetch_enverus_data():
             api_key=creds.get("api_key", "NA")
         )
         
-        # Pulling without specific 'fields' to avoid "incorrect field name" API errors
-        query_generator = d2.query(
-            'well-origins',
-            County='OKLAHOMA',
-            DeletedDate='null',
+        # We use to_dataframe which is more robust for V2. 
+        # We try 'OKLAHOMA' first.
+        df = d2.to_dataframe(
+            dataset='well-origins',
+            county='OKLAHOMA',
+            deleteddate='null',
             pagesize=10000
         )
         
-        data_list = list(query_generator)
-        if not data_list:
-            return pd.DataFrame()
+        # Fallback for case sensitivity in the 'county' value itself
+        if df.empty:
+            df = d2.to_dataframe(
+                dataset='well-origins',
+                county='Oklahoma',
+                deleteddate='null',
+                pagesize=10000
+            )
             
-        df = pd.DataFrame(data_list)
-        
-        # Standardize known variations of Enverus column names
-        rename_dict = {
-            'Well_Name': 'WellName',
-            'Operator_Name': 'OperatorName',
-            'Total_Depth': 'TotalDepth',
-            'Latitude': 'SurfaceLatitude',
-            'Longitude': 'SurfaceLongitude'
-        }
-        df = df.rename(columns=rename_dict)
         return df
     
     except Exception as e:
@@ -79,7 +73,7 @@ def fetch_enverus_data():
 
 # 5. MAIN LOGIC
 if submit_button and raw_address:
-    with st.spinner("Analyzing and Fetching Data..."):
+    with st.spinner("Analyzing location and fetching data..."):
         # Geocode the address
         full_address = f"{raw_address}, Oklahoma County, OK"
         geolocator = ArcGIS(user_agent="okc_well_portal")
@@ -88,12 +82,12 @@ if submit_button and raw_address:
         if location:
             target_lat, target_lon = location.latitude, location.longitude
             
-            # Boundary Logic (File or Fallback)
+            # Boundary Logic
             if uploaded_file:
                 gdf_boundary = gpd.read_file(uploaded_file)
                 property_poly = gdf_boundary.geometry.iloc[0]
             else:
-                # Fallback: 10-acre square (~360ft radius)
+                # Fallback: 10-acre square (~360ft)
                 offset = 0.001
                 property_poly = Polygon([
                     (target_lon-offset, target_lat-offset),
@@ -106,11 +100,12 @@ if submit_button and raw_address:
             df_all = fetch_enverus_data()
 
             if not df_all.empty:
-                # Ensure coordinate columns exist and are numeric
-                lat_col = 'SurfaceLatitude' if 'SurfaceLatitude' in df_all.columns else 'Latitude'
-                lon_col = 'SurfaceLongitude' if 'SurfaceLongitude' in df_all.columns else 'Longitude'
+                # Enverus V2 returns column names like 'SurfaceLatitude' or 'Latitude'
+                # We identify which one exists and standardize it
+                lat_col = next((c for c in ['SurfaceLatitude', 'Latitude', 'surfacelatitude'] if c in df_all.columns), None)
+                lon_col = next((c for c in ['SurfaceLongitude', 'Longitude', 'surfacelongitude'] if c in df_all.columns), None)
                 
-                if lat_col in df_all.columns and lon_col in df_all.columns:
+                if lat_col and lon_col:
                     df_all[lat_col] = pd.to_numeric(df_all[lat_col], errors='coerce')
                     df_all[lon_col] = pd.to_numeric(df_all[lon_col], errors='coerce')
                     df_all = df_all.dropna(subset=[lat_col, lon_col])
@@ -121,16 +116,14 @@ if submit_button and raw_address:
                         (df_all[lon_col].between(target_lon-0.02, target_lon+0.02))
                     ].copy()
 
-                    # Distance Math
                     def calc_dist(row):
                         p = Point(row[lon_col], row[lat_col])
                         if property_poly.contains(p): return 0
-                        return round(property_poly.distance(p) * 364000, 0) # Degrees to Feet
+                        return round(property_poly.distance(p) * 364000, 0)
 
                     if not df_nearby.empty:
                         df_nearby['Dist_to_Prop_ft'] = df_nearby.apply(calc_dist, axis=1)
                         
-                        # Metrics
                         on_prop = len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0])
                         nearby_count = len(df_nearby[df_nearby['Dist_to_Prop_ft'] > 0])
                         
@@ -138,7 +131,7 @@ if submit_button and raw_address:
                         m1.metric("Wells ON Property", on_prop)
                         m2.metric("Wells Nearby (1mi)", nearby_count)
 
-                        # Map
+                        # Map View
                         m = folium.Map(location=[target_lat, target_lon], zoom_start=15)
                         folium.TileLayer(
                             tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -149,25 +142,26 @@ if submit_button and raw_address:
                         
                         for _, row in df_nearby.iterrows():
                             color = 'green' if row['Dist_to_Prop_ft'] == 0 else 'orange'
-                            well_label = row.get('WellName', row.get('Well_Name', 'Unknown Well'))
+                            # Get the best available name column
+                            name_col = next((c for c in ['WellName', 'Well_Name', 'wellname'] if c in df_nearby.columns), 'Unknown')
                             folium.CircleMarker(
                                 location=[row[lat_col], row[lon_col]],
                                 radius=6, color=color, fill=True,
-                                popup=f"Well: {well_label}"
+                                popup=f"Well: {row.get(name_col, 'N/A')}"
                             ).add_to(m)
                         
                         folium_static(m)
                         
                         # Data Table
                         st.subheader("Nearby Well Details")
-                        # Displaying only columns that exist
-                        cols_to_show = [c for c in ['WellName', 'OperatorName', 'Dist_to_Prop_ft', 'TotalDepth'] if c in df_nearby.columns]
-                        st.dataframe(df_nearby[cols_to_show].sort_values('Dist_to_Prop_ft'))
+                        # Display only the columns that actually exist in this dataset version
+                        display_cols = [c for c in ['WellName', 'Well_Name', 'OperatorName', 'Operator_Name', 'Dist_to_Prop_ft', 'TotalDepth', 'Total_Depth'] if c in df_nearby.columns]
+                        st.dataframe(df_nearby[display_cols].sort_values('Dist_to_Prop_ft'))
                     else:
-                        st.warning("No wells found in a 1.5-mile radius of this location.")
+                        st.warning("No wells found in a 1.5-mile radius.")
                 else:
-                    st.error(f"Required coordinate columns missing. Columns found: {list(df_all.columns)}")
+                    st.error(f"Required coordinate columns not found. Found: {list(df_all.columns)}")
             else:
-                st.error("No well data could be retrieved for Oklahoma County.")
+                st.error("The Enverus API returned 0 records for Oklahoma County.")
         else:
-            st.error("Address not found. Please try a more specific address or zip code.")
+            st.error("Address geocoding failed. Please check the address.")
