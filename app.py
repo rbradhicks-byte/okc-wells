@@ -35,6 +35,7 @@ st.markdown(
         border: none;
         padding: 0;
     }}
+    
     .block-container {{
         padding-top: 2rem;
     }}
@@ -71,22 +72,21 @@ def get_enverus_client():
 @st.cache_data(ttl=3600)
 def fetch_ok_county_raw(_client):
     """
-    STRATEGY: The 'Safe' Fetch.
-    1. Filter ONLY by County and DeletedDate (API always accepts this).
-    2. Select specific columns to reduce payload size.
-    3. Cache this result heavily (1 hour) so subsequent searches are instant.
+    STRATEGY: The Safe Fetch.
+    1. Filter ONLY by County='OKLAHOMA' and DeletedDate='null'.
+    2. Fetch specific fields to minimize payload.
+    3. Cache heavily (1 hour) to provide instant subsequent searches.
     """
     if not _client:
         return pd.DataFrame()
 
     try:
-        # Requesting 10k pagesize for efficiency
-        # We request standard fields. 
-        # Note: API might return them as 'Latitude'/'Longitude' depending on version defaults.
+        # We fetch the county index. This avoids 'Invalid Column' errors 
+        # that occur when trying to filter by lat/lon on the server side for V2.
         query_generator = _client.query(
             "well-origins", 
-            County='OKLAHOMA', 
-            DeletedDate='null',
+            county='OKLAHOMA', 
+            deleteddate='null',
             fields='WellName,OperatorName,API_UWI_14,TotalDepth,SurfaceLatitude,SurfaceLongitude',
             pagesize=10000
         )
@@ -96,8 +96,9 @@ def fetch_ok_county_raw(_client):
         if df.empty:
             return df
 
-        # NORMALIZE COLUMNS: Ensure we have SurfaceLatitude/SurfaceLongitude
-        # Sometimes V2 returns 'Latitude' instead of 'SurfaceLatitude' in the dict keys
+        # NORMALIZE COLUMNS:
+        # V2 DirectAccess sometimes maps the requested 'SurfaceLatitude' to 'Latitude' in the output JSON.
+        # We normalize to 'SurfaceLatitude' for consistency.
         rename_map = {}
         if 'Latitude' in df.columns: rename_map['Latitude'] = 'SurfaceLatitude'
         if 'Longitude' in df.columns: rename_map['Longitude'] = 'SurfaceLongitude'
@@ -204,9 +205,8 @@ if submit_btn and user_address_input:
                 full_county_df = fetch_ok_county_raw(client)
             
             if not full_county_df.empty:
-                # 2. PYTHON FILTERING (The Safe Method)
+                # 2. PYTHON FILTERING
                 # Filter to +/- 0.03 degrees (~2 miles)
-                # This prevents "Invalid Column" API errors
                 offset = 0.03
                 wells_df = full_county_df[
                     (full_county_df['SurfaceLatitude'].between(lat - offset, lat + offset)) & 
@@ -226,6 +226,7 @@ if submit_btn and user_address_input:
                     projected_wells = wells_gdf.to_crs("EPSG:32124")
                     
                     # Calculate distance from property boundary
+                    # Distance is 0 if inside the polygon
                     projected_wells['Distance_ft'] = projected_wells.geometry.apply(
                         lambda x: projected_aoi.distance(x)
                     ) * 3.28084 # Convert Meters to Feet
