@@ -52,25 +52,17 @@ def fetch_live_enverus():
         creds = st.secrets["enverus"]
         d2 = DirectAccessV2(client_id=creds["client_id"], client_secret=creds["client_secret"], api_key=creds.get("api_key", "NA"))
         
-        # Attempt 1: Standard V2 Query
-        # We use the most common case-sensitive keywords for Oklahoma
-        query = d2.query('well-origins', County='OKLAHOMA', StateProvince='OK', pagesize=1000)
+        # WE REMOVE ALL KEYWORD FILTERS (Like County/State) TO PREVENT API ERRORS.
+        # We fetch the first 10,000 records from the dataset globally.
+        query = d2.query('well-origins', pagesize=10000)
         df = pd.DataFrame(list(query))
-        
-        # Attempt 2: Fallback to title-case if All-Caps fails
-        if df.empty:
-            query = d2.query('well-origins', County='Oklahoma', StateProvince='OK', pagesize=1000)
-            df = pd.DataFrame(list(query))
 
-        # Diagnostic: If still empty, pull ANY 1 record to see valid column names
-        if df.empty:
-            st.warning("No wells found for Oklahoma County. Running Diagnostic...")
-            diag = list(d2.query('well-origins', pagesize=1))
-            if diag:
-                st.write("Diagnostic - Valid Columns found in your account:", list(diag[0].keys()))
-                st.write("Diagnostic - Sample Data for first record:", diag[0])
-            else:
-                st.error("Diagnostic failed: Even a broad query returned no data. Check dataset permissions.")
+        if not df.empty:
+            # We filter for Oklahoma in Python memory to bypass the API's 'stateprovince' error.
+            # We look for ANY column that might contain county or state info.
+            county_col = next((c for c in df.columns if 'county' in c.lower()), None)
+            if county_col:
+                df = df[df[county_col].astype(str).str.upper().str.contains('OKLAHOMA', na=False)]
         
         return df
     except Exception as e:
@@ -95,7 +87,7 @@ if submit_button and raw_address:
                 df_all = get_dummy_data(t_lat, t_lon)
 
             if not df_all.empty:
-                # Find Column Names Dynamically
+                # Coordinate Identification
                 lat_col = next((c for c in df_all.columns if c.lower() in ['surfacelatitude', 'latitude']), None)
                 lon_col = next((c for c in df_all.columns if c.lower() in ['surfacelongitude', 'longitude']), None)
                 
@@ -133,8 +125,8 @@ if submit_button and raw_address:
                     st.subheader("Well Details")
                     st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
                 else:
-                    st.error(f"Required coordinates missing. Found columns: {list(df_all.columns)}")
+                    st.error(f"No coordinate columns found. Columns: {list(df_all.columns)}")
             else:
-                st.error("No data returned. If using Live API, look at the Diagnostic warnings above.")
+                st.error("No data returned from Enverus. Verify your credentials and that your account has 'Read' access to the well-origins dataset.")
         else:
             st.error("Address not found.")
