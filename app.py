@@ -37,7 +37,7 @@ with st.form("search_form"):
 st.sidebar.header("Property Settings")
 uploaded_file = st.sidebar.file_uploader("Upload Property Boundary (.geojson)", type=['geojson'])
 
-# 4. DATA FETCHING (Minimum Viable Query)
+# 4. DATA FETCHING (Minimalist Query)
 def fetch_enverus_data():
     try:
         creds = st.secrets["enverus"]
@@ -47,11 +47,11 @@ def fetch_enverus_data():
             api_key=creds.get("api_key", "NA")
         )
         
-        # Using PascalCase for keyword arguments as per V2 documentation
+        # 'well-origins' V2 typically only accepts 'County' and 'DeletedDate'
+        # We use all-caps for the value 'OKLAHOMA' as per standard DB indexing
         query_generator = d2.query(
             'well-origins',
             County='OKLAHOMA',
-            StateProvince='OK',
             pagesize=10000
         )
         
@@ -75,11 +75,12 @@ if submit_button and raw_address:
         if location:
             target_lat, target_lon = location.latitude, location.longitude
             
-            # Boundary Logic (User file or 10-acre square fallback)
+            # Boundary Logic
             if uploaded_file:
                 gdf_boundary = gpd.read_file(uploaded_file)
                 property_poly = gdf_boundary.geometry.iloc[0]
             else:
+                # 10-acre square fallback
                 offset = 0.001
                 property_poly = Polygon([
                     (target_lon-offset, target_lat-offset),
@@ -91,7 +92,8 @@ if submit_button and raw_address:
             df_all = fetch_enverus_data()
 
             if not df_all.empty:
-                # Coordinate Identification logic
+                # Identification of Enverus V2 coordinate columns
+                # Typically 'SurfaceLatitude' and 'SurfaceLongitude'
                 lat_col = next((c for c in df_all.columns if c.lower() in ['surfacelatitude', 'latitude']), None)
                 lon_col = next((c for c in df_all.columns if c.lower() in ['surfacelongitude', 'longitude']), None)
                 
@@ -109,7 +111,6 @@ if submit_button and raw_address:
                     def calc_dist(row):
                         p = Point(row[lon_col], row[lat_col])
                         if property_poly.contains(p): return 0
-                        # Approx conversion degrees to feet
                         return round(property_poly.distance(p) * 364000, 0)
 
                     if not df_nearby.empty:
@@ -119,7 +120,6 @@ if submit_button and raw_address:
                         m1.metric("Wells ON Property", len(df_nearby[df_nearby['Dist_to_Prop_ft'] == 0]))
                         m2.metric("Wells Nearby (1mi)", len(df_nearby[df_nearby['Dist_to_Prop_ft'] > 0]))
 
-                        # MAP INITIALIZATION
                         m = folium.Map(location=[target_lat, target_lon], zoom_start=15)
                         folium.TileLayer(
                             tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -144,10 +144,10 @@ if submit_button and raw_address:
                         st.subheader("Nearby Well Details")
                         st.dataframe(df_nearby.sort_values('Dist_to_Prop_ft'))
                     else:
-                        st.warning("Address found, but no wells are within 1.5 miles in the Enverus results.")
+                        st.warning("No wells found in a 1.5-mile radius.")
                 else:
-                    st.error(f"Coordinates missing. Available columns: {list(df_all.columns)}")
+                    st.error(f"Coordinates missing. Columns found: {list(df_all.columns)}")
             else:
-                st.error("Enverus returned 0 records. Ensure your API account has access to the 'well-origins' dataset for Oklahoma.")
+                st.error("Enverus returned 0 records for Oklahoma County.")
         else:
-            st.error("Address not found.")
+            st.error("Address geocoding failed.")
